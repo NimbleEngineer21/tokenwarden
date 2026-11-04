@@ -1,0 +1,32 @@
+# Git hooks. Install with: lefthook install
+# Tool versions come from mise.toml.
+
+pre-commit:
+  parallel: true
+  jobs:
+    - name: format
+      glob: "*.go"
+      run: mise exec -- golangci-lint fmt --diff {staged_files}
+    - name: lint
+      glob: "*.go"
+      run: mise exec -- golangci-lint run --new-from-rev=HEAD --fix=false ./...
+    - name: secrets
+      run: mise exec -- gitleaks git --pre-commit --staged --redact --no-banner .
+    - name: actionlint
+      glob: ".github/workflows/*.{yml,yaml}"
+      run: mise exec -- actionlint {staged_files}
+
+commit-msg:
+  jobs:
+    - name: conventional-commit
+      run: scripts/check-commit-msg.sh {1}
+
+pre-push:
+  parallel: false
+  jobs:
+    - name: tidy
+      run: scripts/check-tidy.sh
+    - name: build
+      run: mise exec -- go build ./...
+    - name: test
+      run: mise exec -- go test -race -count=1 ./...

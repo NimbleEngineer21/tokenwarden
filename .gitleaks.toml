@@ -1,0 +1,12 @@
+title = "tokenwarden gitleaks config"
+
+[extend]
+useDefault = true
+
+# Test-only key formats used in fixtures and docs. They are never real credentials.
+[[allowlists]]
+description = "test fixture keys"
+regexes = [
+  '''tw_test_[A-Za-z0-9]+''',
+  '''sk-ant-test-[A-Za-z0-9-]+''',
+]

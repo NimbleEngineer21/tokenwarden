@@ -2,6 +2,11 @@ package mock
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -141,4 +146,120 @@ func TestDelayBeforeStatusFault(t *testing.T) {
 			t.Fatalf("status %d after %v, want 529 after 1s", rec.code, time.Since(start))
 		}
 	})
+}
+
+var update = flag.Bool("update", false, "rewrite the golden files in testdata")
+
+// goldenStreams are the requests whose exact stream bytes the golden files
+// pin. A change to the seed, the content, or the encoding changes them.
+func goldenStreams(t *testing.T) map[string]string {
+	t.Helper()
+	tools, _ := presetTools(t)
+	return map[string]string{
+		"stream_text.golden": msgBody("golden text reply", 30, true, ""),
+		"stream_tool.golden": msgBody("golden tool reply", 200, true,
+			tools+`,"tool_choice":{"type":"tool","name":"mcp__github__create_issue"}`),
+	}
+}
+
+func TestStreamGolden(t *testing.T) {
+	for name, body := range goldenStreams(t) {
+		t.Run(name, func(t *testing.T) {
+			got := serve(t, New(Config{}), body).body()
+			path := filepath.Join("testdata", name)
+			if *update {
+				if err := os.WriteFile(path, []byte(got), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("%v (run go test -run TestStreamGolden -update to create it)", err)
+			}
+			if got != string(want) {
+				t.Fatalf("stream bytes differ from %s; if the change is intended, run go test -run TestStreamGolden -update\ngot:\n%s", path, got)
+			}
+		})
+	}
+}
+
+// TestStreamMatchesDocsShape checks each event of the golden requests against the JSON keys
+// of the same event type in the example streams of the Messages API docs
+// (platform.claude.com/docs/en/build-with-claude/streaming, read
+// 2026-11-05). testdata/docs_event_keys.json holds those key paths. The mock
+// may send more keys than the example, never fewer.
+func TestStreamMatchesDocsShape(t *testing.T) {
+	raw, err := os.ReadFile("testdata/docs_event_keys.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var docs map[string][]string
+	if err := json.Unmarshal(raw, &docs); err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	// The live output is checked, not the golden files, so that an -update
+	// run cannot hide a lost key.
+	for name, body := range goldenStreams(t) {
+		live := serve(t, New(Config{}), body).body()
+		rd := anthropic.NewReader(strings.NewReader(live), anthropic.Limits{})
+		for {
+			ev, err := rd.Next()
+			if err != nil {
+				break
+			}
+			var obj map[string]any
+			if err := json.Unmarshal(ev.Data, &obj); err != nil {
+				t.Fatal(err)
+			}
+			kind := eventKind(obj)
+			want, ok := docs[kind]
+			if !ok {
+				t.Fatalf("%s: event %s has no docs example", name, kind)
+			}
+			seen[kind] = true
+			have := keyPaths(obj, "")
+			for _, k := range want {
+				if !slices.Contains(have, k) {
+					t.Errorf("%s: %s lacks key %q that the docs example has", name, kind, k)
+				}
+			}
+		}
+	}
+	for kind := range docs {
+		if !seen[kind] {
+			t.Errorf("no golden stream sends %s", kind)
+		}
+	}
+}
+
+// eventKind names an event by its type, plus the block or delta type for
+// content_block_start and content_block_delta.
+func eventKind(obj map[string]any) string {
+	kind, _ := obj["type"].(string)
+	switch kind {
+	case anthropic.EventContentBlockStart:
+		cb, _ := obj["content_block"].(map[string]any)
+		sub, _ := cb["type"].(string)
+		kind += ":" + sub
+	case anthropic.EventContentBlockDelta:
+		d, _ := obj["delta"].(map[string]any)
+		sub, _ := d["type"].(string)
+		kind += ":" + sub
+	}
+	return kind
+}
+
+// keyPaths returns the dotted path of every object key in v.
+func keyPaths(v any, prefix string) []string {
+	obj, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	var out []string
+	for k, x := range obj {
+		out = append(out, prefix+k)
+		out = append(out, keyPaths(x, prefix+k+".")...)
+	}
+	return out
 }

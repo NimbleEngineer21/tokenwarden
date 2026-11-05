@@ -1,0 +1,68 @@
+[
+  {
+    "name": "mcp__github__create_issue",
+    "description": "Create an issue in a GitHub repository.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "owner": {"type": "string"},
+        "repo": {"type": "string"},
+        "title": {"type": "string"},
+        "body": {"type": "string"},
+        "labels": {"type": "array", "items": {"type": "string"}},
+        "milestone": {"type": "integer"}
+      },
+      "required": ["owner", "repo", "title"]
+    }
+  },
+  {
+    "name": "mcp__github__get_file_contents",
+    "description": "Read a file from a GitHub repository.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "owner": {"type": "string"},
+        "repo": {"type": "string"},
+        "path": {"type": "string"},
+        "ref": {"type": ["string", "null"]}
+      },
+      "required": ["owner", "repo", "path"]
+    }
+  },
+  {
+    "name": "mcp__filesystem__read_file",
+    "description": "Read a file from the workspace.",
+    "input_schema": {
+      "type": "object",
+      "properties": {"path": {"type": "string"}},
+      "required": ["path"]
+    }
+  },
+  {
+    "name": "mcp__filesystem__write_file",
+    "description": "Write a file in the workspace.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"},
+        "content": {"type": "string"},
+        "mode": {"type": "string", "enum": ["overwrite", "append"]}
+      },
+      "required": ["path", "content"]
+    }
+  },
+  {
+    "name": "mcp__slack__post_message",
+    "description": "Post a message to a Slack channel.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "channel": {"type": "string"},
+        "text": {"type": "string"},
+        "unfurl_links": {"type": "boolean"},
+        "priority": {"type": "number"}
+      },
+      "required": ["channel", "text"]
+    }
+  }
+]

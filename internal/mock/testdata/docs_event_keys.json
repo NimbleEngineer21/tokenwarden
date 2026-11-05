@@ -1,0 +1,64 @@
+{
+  "content_block_delta:input_json_delta": [
+    "delta",
+    "delta.partial_json",
+    "delta.type",
+    "index",
+    "type"
+  ],
+  "content_block_delta:text_delta": [
+    "delta",
+    "delta.text",
+    "delta.type",
+    "index",
+    "type"
+  ],
+  "content_block_start:text": [
+    "content_block",
+    "content_block.text",
+    "content_block.type",
+    "index",
+    "type"
+  ],
+  "content_block_start:tool_use": [
+    "content_block",
+    "content_block.id",
+    "content_block.input",
+    "content_block.name",
+    "content_block.type",
+    "index",
+    "type"
+  ],
+  "content_block_stop": [
+    "index",
+    "type"
+  ],
+  "message_delta": [
+    "delta",
+    "delta.stop_reason",
+    "delta.stop_sequence",
+    "type",
+    "usage",
+    "usage.output_tokens"
+  ],
+  "message_start": [
+    "message",
+    "message.content",
+    "message.id",
+    "message.model",
+    "message.role",
+    "message.stop_reason",
+    "message.stop_sequence",
+    "message.type",
+    "message.usage",
+    "message.usage.input_tokens",
+    "message.usage.output_tokens",
+    "type"
+  ],
+  "message_stop": [
+    "type"
+  ],
+  "ping": [
+    "type"
+  ]
+}

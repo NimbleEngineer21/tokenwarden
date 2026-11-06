@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
@@ -11,6 +12,9 @@ import (
 	"testing"
 	"testing/synctest"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/NimbleEngineer21/tokenwarden/audit"
 	"github.com/NimbleEngineer21/tokenwarden/internal/anthropic"
 )
 
@@ -101,9 +105,15 @@ func TestStreamCleanEnd(t *testing.T) {
 	const upErr = "event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"
 	tests := []struct {
 		name, upstream, want string
+		outcome              audit.Outcome
+		errType              string
 	}{
-		{"after error event", start + upErr, start + upErr},
-		{"without message_stop", start, start + "event: error\ndata: " + string(anthropic.NewErrorBody(anthropic.ErrAPI, errIncomplete, "")) + "\n\n"},
+		{"after error event", start + upErr, start + upErr, audit.OutcomeUpstreamError, anthropic.ErrOverloaded},
+		{
+			"without message_stop", start,
+			start + "event: error\ndata: " + string(anthropic.NewErrorBody(anthropic.ErrAPI, errIncomplete, "")) + "\n\n",
+			audit.OutcomeIncomplete, anthropic.ErrAPI,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -112,13 +122,17 @@ func TestStreamCleanEnd(t *testing.T) {
 				_, _ = io.WriteString(w, tt.upstream)
 			}))
 			defer us.Close()
-			h, err := New(Config{UpstreamURL: us.URL, UpstreamKey: upstreamKey, Authenticator: newAuth(t)})
+			rec := make(chanRecorder, 1)
+			h, err := New(Config{UpstreamURL: us.URL, UpstreamKey: upstreamKey, Authenticator: newAuth(t), Recorder: rec})
 			if err != nil {
 				t.Fatal(err)
 			}
 			gs := httptest.NewServer(h)
 			defer gs.Close()
 			resp := do(t, gs.URL+"/v1/messages", streamBody, keyHeader())
+			if ev := <-rec; ev.Outcome != tt.outcome || ev.ErrorType != tt.errType {
+				t.Errorf("event outcome %q error %q, want %q %q", ev.Outcome, ev.ErrorType, tt.outcome, tt.errType)
+			}
 			// The gateway puts its request ID in the error event; blank it so
 			// that the bytes compare.
 			got := strings.Replace(string(resp.Body), `,"request_id":"`+resp.Header.Get(RequestIDHeader)+`"`, "", 1)
@@ -220,6 +234,65 @@ func TestStreamFlushesEachEvent(t *testing.T) {
 		<-done
 		if got := rec.flushedString(); got != want.String() {
 			t.Fatalf("final stream = %q, want %q", got, want.String())
+		}
+	})
+}
+
+// TestStreamClientGone checks that a client that leaves mid-stream gets the
+// canceled outcome, and that the active-stream gauge counts the stream while
+// it is open and drops when it ends.
+func TestStreamClientGone(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		pr, pw := io.Pipe()
+		rt := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			// A real transport closes the body when the request context ends.
+			go func() {
+				<-r.Context().Done()
+				_ = pr.CloseWithError(r.Context().Err())
+			}()
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": {"text/event-stream"}},
+				Body:       pr,
+				Request:    r,
+			}, nil
+		})
+		rec := make(chanRecorder, 1)
+		reg := prometheus.NewRegistry()
+		h, err := New(Config{
+			UpstreamURL:   "http://upstream.test",
+			UpstreamKey:   upstreamKey,
+			Authenticator: newAuth(t),
+			Client:        &http.Client{Transport: rt},
+			Recorder:      rec,
+			Registerer:    reg,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/messages", strings.NewReader(streamBody))
+		req.Header.Set("X-Api-Key", gatewayKey)
+		w := &flushRecorder{header: http.Header{}}
+		go h.ServeHTTP(w, req)
+
+		if _, err := io.WriteString(pw, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5}}}\n\n"); err != nil {
+			t.Fatal(err)
+		}
+		synctest.Wait()
+		if got := metricValue(t, reg, "tokenwarden_streams_active", map[string]string{}); got != 1 {
+			t.Fatalf("streams_active = %v during the stream, want 1", got)
+		}
+		cancel()
+		ev := <-rec
+		if ev.Outcome != audit.OutcomeCanceled || ev.Usage.InputTokens != 5 {
+			t.Fatalf("event outcome %q usage %+v; want canceled with 5 input tokens", ev.Outcome, ev.Usage)
+		}
+		if got := metricValue(t, reg, "tokenwarden_streams_active", map[string]string{}); got != 0 {
+			t.Fatalf("streams_active = %v after the stream, want 0", got)
+		}
+		if strings.Contains(w.flushedString(), "event: error") {
+			t.Fatal("the gateway wrote an error event to a client that had gone")
 		}
 	})
 }

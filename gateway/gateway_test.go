@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,6 +12,9 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/NimbleEngineer21/tokenwarden/audit"
 	"github.com/NimbleEngineer21/tokenwarden/auth"
 	"github.com/NimbleEngineer21/tokenwarden/internal/anthropic"
 	"github.com/NimbleEngineer21/tokenwarden/internal/mock"
@@ -63,6 +67,23 @@ type stack struct {
 	mock    *httptest.Server
 	spy     *spy
 	gateway *httptest.Server
+	rec     *chanRecorder
+	reg     *prometheus.Registry
+}
+
+// chanRecorder hands each audit event to the test. The gateway records after
+// the handler returns, which can be after the client has read the reply, so
+// a test waits on the channel rather than reading shared state.
+type chanRecorder chan *audit.Event
+
+func (c chanRecorder) Record(_ context.Context, ev *audit.Event) error {
+	c <- ev
+	return nil
+}
+
+func (s *stack) event(t *testing.T) *audit.Event {
+	t.Helper()
+	return <-*s.rec
 }
 
 // newStack starts the mock upstream at full speed and a gateway that sends
@@ -72,13 +93,15 @@ func newStack(t *testing.T, key string) *stack {
 	sp := &spy{next: mock.New(mock.Config{})}
 	ms := httptest.NewServer(sp)
 	t.Cleanup(ms.Close)
-	h, err := New(Config{UpstreamURL: ms.URL, UpstreamKey: key, Authenticator: newAuth(t)})
+	rec := make(chanRecorder, 16)
+	reg := prometheus.NewRegistry()
+	h, err := New(Config{UpstreamURL: ms.URL, UpstreamKey: key, Authenticator: newAuth(t), Recorder: rec, Registerer: reg})
 	if err != nil {
 		t.Fatal(err)
 	}
 	gs := httptest.NewServer(h)
 	t.Cleanup(gs.Close)
-	return &stack{mock: ms, spy: sp, gateway: gs}
+	return &stack{mock: ms, spy: sp, gateway: gs, rec: &rec, reg: reg}
 }
 
 func (s *stack) setFault(t *testing.T, fault string) {

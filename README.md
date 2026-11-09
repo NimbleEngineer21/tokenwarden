@@ -37,6 +37,18 @@ Planned for the first releases:
 - **Library first:** use the `http.Handler` middleware and its interfaces in
   your own gateway, or run the reference binary.
 
+## Run the gateway
+
+```sh
+go run ./cmd/mockanthropic &   # mock upstream on 127.0.0.1:8081
+TW_UPSTREAM_URL=http://127.0.0.1:8081 TW_UPSTREAM_KEY=sk-ant-test-mock \
+  go run ./cmd/tokenwarden -keys keys.json
+```
+
+The upstream URL and key come from the environment only. The key file holds
+SHA-256 hashes of gateway keys. See [docs/tokenwarden.md](docs/tokenwarden.md)
+for the key-file format, how to hash a key, the flags, and the metric names.
+
 ## Development
 
 ```sh

@@ -108,6 +108,9 @@ func LoadStatic(r io.Reader) (*Static, error) {
 	return NewStatic(f.Keys)
 }
 
+// Len returns the number of keys in the store.
+func (s *Static) Len() int { return len(s.byHash) }
+
 // Authenticate implements [Authenticator].
 func (s *Static) Authenticate(_ context.Context, key string) (Identity, error) {
 	// The lookup is by hash, so its timing tells nothing about a stored key.

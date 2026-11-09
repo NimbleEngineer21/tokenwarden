@@ -37,11 +37,21 @@ import (
 // Streams that are still open after it are cut.
 const shutdownGrace = 10 * time.Second
 
+// errUsage means that the command line was wrong and the usage text is
+// already printed.
+var errUsage = errors.New("usage error")
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// After the first signal, restore the default handling, so that a second
+	// signal stops the process during the grace period.
+	context.AfterFunc(ctx, stop)
 	err := run(ctx, os.Args[1:], os.Getenv, os.Stderr)
 	stop()
-	if err != nil {
+	switch {
+	case errors.Is(err, errUsage):
+		os.Exit(2)
+	case err != nil:
 		fmt.Fprintln(os.Stderr, "tokenwarden:", err)
 		os.Exit(1)
 	}
@@ -80,7 +90,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 	}
 	log.InfoContext(ctx, "listening", "addr", proxyLn.Addr().String(), "metrics_addr", metricsLn.Addr().String())
 	proxySrv, metricsSrv := servers(proxy, metrics)
-	return serve(ctx, []served{{proxySrv, proxyLn}, {metricsSrv, metricsLn}})
+	return serve(ctx, log, []served{{"proxy", proxySrv, proxyLn}, {"metrics", metricsSrv, metricsLn}})
 }
 
 func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (config, error) {
@@ -91,10 +101,15 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", "127.0.0.1:9090", "metrics listen address; must use a port other than -addr")
 	fs.StringVar(&cfg.keysPath, "keys", "", "JSON key file of SHA-256 gateway key hashes (required)")
 	if err := fs.Parse(args); err != nil {
-		return config{}, err
+		if errors.Is(err, flag.ErrHelp) {
+			return config{}, err
+		}
+		return config{}, errUsage
 	}
 	if fs.NArg() > 0 {
-		return config{}, fmt.Errorf("unexpected argument %q", fs.Arg(0))
+		fmt.Fprintf(stderr, "unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		return config{}, errUsage
 	}
 	cfg.upstreamURL = getenv("TW_UPSTREAM_URL")
 	cfg.upstreamKey = getenv("TW_UPSTREAM_KEY")
@@ -209,16 +224,18 @@ func servers(proxy, metrics http.Handler) (proxySrv, metricsSrv *http.Server) {
 	return proxySrv, metricsSrv
 }
 
-// served is a server and the listener that it serves on.
+// served is a named server and the listener that it serves on.
 type served struct {
-	srv *http.Server
-	ln  net.Listener
+	name string
+	srv  *http.Server
+	ln   net.Listener
 }
 
 // serve runs each server until ctx is done or one server fails. Then it
 // shuts all of them down, and after [shutdownGrace] it cuts the open
-// requests.
-func serve(ctx context.Context, all []served) error {
+// requests. Cutting requests at the end of the grace period is normal, not
+// an error.
+func serve(ctx context.Context, log *slog.Logger, all []served) error {
 	errc := make(chan error, len(all))
 	for _, s := range all {
 		go func() { errc <- s.srv.Serve(s.ln) }()
@@ -236,6 +253,10 @@ func serve(ctx context.Context, all []served) error {
 	for i, s := range all {
 		go func() {
 			if err := s.srv.Shutdown(sctx); err != nil {
+				if errors.Is(err, context.DeadlineExceeded) {
+					log.WarnContext(sctx, "shutdown grace period ended; open requests cut", "server", s.name, "grace", shutdownGrace.String())
+					err = nil
+				}
 				errs[i] = errors.Join(err, s.srv.Close())
 			}
 			done <- i

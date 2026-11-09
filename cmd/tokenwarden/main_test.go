@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -76,20 +77,22 @@ func TestConfigErrors(t *testing.T) {
 		args []string
 		env  map[string]string
 		want string
+		is   error
 	}{
-		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set"},
-		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set"},
-		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL"},
-		{"no keys flag", nil, env, "-keys is required"},
-		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "no such file"},
-		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file"},
-		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field"},
-		{"zero keys", []string{"-keys", writeFile(t, `{"keys":[]}`)}, env, "holds no keys"},
-		{"addr without port", []string{"-keys", good, "-addr", "127.0.0.1"}, env, "-addr"},
-		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number"},
-		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number"},
-		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr"},
-		{"extra argument", []string{"-keys", good, "serve"}, env, "unexpected argument"},
+		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set", nil},
+		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set", nil},
+		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL", nil},
+		{"no keys flag", nil, env, "-keys is required", nil},
+		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "-keys", fs.ErrNotExist},
+		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file", nil},
+		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field", nil},
+		{"zero keys", []string{"-keys", writeFile(t, `{"keys":[]}`)}, env, "holds no keys", nil},
+		{"addr without port", []string{"-keys", good, "-addr", "127.0.0.1"}, env, "-addr", nil},
+		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number", nil},
+		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number", nil},
+		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr", nil},
+		{"unknown flag", []string{"-keys", good, "-bogus"}, env, "flag provided but not defined: -bogus", errUsage},
+		{"extra argument", []string{"-keys", good, "serve"}, env, `unexpected argument "serve"`, errUsage},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -98,8 +101,22 @@ func TestConfigErrors(t *testing.T) {
 			if err == nil {
 				_, _, err = handlers(cfg, slog.New(slog.DiscardHandler))
 			}
-			if err == nil || !strings.Contains(err.Error(), tt.want) {
-				t.Fatalf("error = %v, want it to contain %q", err, tt.want)
+			if err == nil {
+				t.Fatal("error = nil")
+			}
+			if tt.is != nil && !errors.Is(err, tt.is) {
+				t.Fatalf("error = %v, want %v", err, tt.is)
+			}
+			// A usage error is printed to stderr once; main does not print it again.
+			text := err.Error()
+			if errors.Is(err, errUsage) {
+				text = stderr.String()
+				if n := strings.Count(text, tt.want); n != 1 {
+					t.Fatalf("stderr holds %q %d times:\n%s", tt.want, n, text)
+				}
+			}
+			if !strings.Contains(text, tt.want) {
+				t.Fatalf("error = %v, stderr = %q, want %q", err, stderr.String(), tt.want)
 			}
 			if strings.Contains(err.Error(), upstreamKey) {
 				t.Fatalf("error holds the upstream key: %v", err)
@@ -349,11 +366,26 @@ func TestRunFailsOnBusyPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer busy.Close()
+	// Find a free port for the proxy, so that the test can check that run
+	// releases it.
+	free, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyAddr := free.Addr().String()
+	if err := free.Close(); err != nil {
+		t.Fatal(err)
+	}
 	env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}
-	args := []string{"-keys", keyFile(t), "-addr", "127.0.0.1:0", "-metrics-addr", busy.Addr().String()}
+	args := []string{"-keys", keyFile(t), "-addr", proxyAddr, "-metrics-addr", busy.Addr().String()}
 	if err := run(t.Context(), args, envOf(env), io.Discard); err == nil {
 		t.Fatal("run on a busy metrics port = nil, want an error")
 	}
+	again, err := lc.Listen(t.Context(), "tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("run did not release the proxy port: %v", err)
+	}
+	again.Close()
 }
 
 func TestServeShutsDownBothListeners(t *testing.T) {
@@ -372,7 +404,9 @@ func TestServeShutsDownBothListeners(t *testing.T) {
 	proxySrv, metricsSrv := servers(http.NotFoundHandler(), http.NotFoundHandler())
 	ctx, cancel := context.WithCancel(t.Context())
 	errc := make(chan error, 1)
-	go func() { errc <- serve(ctx, []served{{proxySrv, lns[0]}, {metricsSrv, lns[1]}}) }()
+	go func() {
+		errc <- serve(ctx, slog.New(slog.DiscardHandler), []served{{"proxy", proxySrv, lns[0]}, {"metrics", metricsSrv, lns[1]}})
+	}()
 	cancel()
 	if err := <-errc; err != nil {
 		t.Fatalf("serve = %v", err)
@@ -451,9 +485,13 @@ func TestServeCutsStreamsAfterGrace(t *testing.T) {
 		})
 		proxySrv, metricsSrv := servers(stream, http.NotFoundHandler())
 		pl := newPipeListener()
+		logs := &syncBuffer{}
+		log := slog.New(slog.NewJSONHandler(logs, nil))
 		ctx, cancel := context.WithCancel(t.Context())
 		errc := make(chan error, 1)
-		go func() { errc <- serve(ctx, []served{{proxySrv, pl}, {metricsSrv, newPipeListener()}}) }()
+		go func() {
+			errc <- serve(ctx, log, []served{{"proxy", proxySrv, pl}, {"metrics", metricsSrv, newPipeListener()}})
+		}()
 
 		c := pl.dial()
 		defer c.Close()
@@ -490,9 +528,20 @@ func TestServeCutsStreamsAfterGrace(t *testing.T) {
 		if elapsed := time.Since(start); elapsed != shutdownGrace {
 			t.Fatalf("serve returned after %v, want %v", elapsed, shutdownGrace)
 		}
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("serve = %v, want context.DeadlineExceeded", err)
+		if err != nil {
+			t.Fatalf("serve = %v, want nil: a cut at the end of the grace period is normal", err)
 		}
 		<-cut
+		var warns []string
+		for line := range strings.Lines(logs.String()) {
+			var rec struct{ Level, Msg, Server string }
+			if err := json.Unmarshal([]byte(line), &rec); err != nil {
+				t.Fatalf("log line is not JSON: %q", line)
+			}
+			warns = append(warns, rec.Level+"/"+rec.Server+"/"+rec.Msg)
+		}
+		if want := []string{"WARN/proxy/shutdown grace period ended; open requests cut"}; !slices.Equal(warns, want) {
+			t.Fatalf("logs = %v, want %v", warns, want)
+		}
 	})
 }

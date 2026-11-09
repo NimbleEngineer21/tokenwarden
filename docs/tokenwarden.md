@@ -54,7 +54,12 @@ The gateway does not start when the key file is missing, is not valid, or
 holds no keys.
 
 On SIGINT or SIGTERM, the gateway stops accepting connections and lets open
-requests run for 10 seconds. Then it cuts the streams that are still open.
+requests run for 10 seconds. Then it cuts the streams that are still open,
+logs a warning, and exits 0. A second signal stops the gateway at once, with
+the default status for that signal (130 for SIGINT, 143 for SIGTERM).
+
+Exit codes: 0 after a stop signal, 1 when the gateway cannot start or a
+listener fails, 2 for a wrong command line.
 
 ## Key file
 

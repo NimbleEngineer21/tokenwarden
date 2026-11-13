@@ -43,7 +43,7 @@ jobs:
       fail-fast: false
       matrix:
         # Oldest supported release (the go.mod directive) and newest stable.
-        go: ["1.26.10", "1.27.3"]
+        go: ["1.26.11", "1.27.4"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

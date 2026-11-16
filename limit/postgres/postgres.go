@@ -7,7 +7,7 @@
 // of the replica, not from the database clock; replica clocks must agree to
 // well within a window length.
 //
-// The database must have the tokenwarden schema.
+// The database must have the tokenwarden schema; [Migrate] creates it.
 package postgres
 
 import (
@@ -20,9 +20,18 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/NimbleEngineer21/tokenwarden/internal/store"
 	"github.com/NimbleEngineer21/tokenwarden/internal/store/db"
 	"github.com/NimbleEngineer21/tokenwarden/limit"
 )
+
+// Migrate creates or updates the tokenwarden schema in the database of
+// pool. Run it before the first [New]. Replicas that start at the same time
+// can all call it: a lock makes them wait for each other. It returns an
+// error if a newer release already migrated the database.
+func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
+	return store.Migrate(ctx, pool)
+}
 
 // Limiter is a [limit.Limiter] backed by Postgres. It is safe for
 // concurrent use, and any number of Limiters can share one database.

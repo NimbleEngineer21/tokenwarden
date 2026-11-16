@@ -8,7 +8,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/NimbleEngineer21/tokenwarden/internal/pgtest"
-	"github.com/NimbleEngineer21/tokenwarden/internal/store"
 	"github.com/NimbleEngineer21/tokenwarden/limit"
 	"github.com/NimbleEngineer21/tokenwarden/limit/limittest"
 	"github.com/NimbleEngineer21/tokenwarden/limit/postgres"
@@ -18,7 +17,7 @@ import (
 func newPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool := pgtest.New(t)
-	if err := store.Migrate(t.Context(), pool); err != nil {
+	if err := postgres.Migrate(t.Context(), pool); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
 	return pool

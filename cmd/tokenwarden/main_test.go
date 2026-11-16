@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -16,19 +17,26 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/NimbleEngineer21/tokenwarden/auth"
 	"github.com/NimbleEngineer21/tokenwarden/internal/mock"
+	"github.com/NimbleEngineer21/tokenwarden/internal/pgtest"
+	"github.com/NimbleEngineer21/tokenwarden/limit"
+	"github.com/NimbleEngineer21/tokenwarden/limit/postgres"
 )
 
 const (
 	gatewayKey  = "tw_test_cmdgateway"
 	upstreamKey = "sk-ant-test-cmdupstream"
+	dbPassword  = "tw_test_cmddbpassword"
 )
 
 // writeFile writes data to a new file in a test directory and returns its
@@ -49,6 +57,13 @@ func keyFile(t *testing.T) string {
 
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
+}
+
+// withDB returns a copy of env with TW_DATABASE_URL set to dbURL.
+func withDB(env map[string]string, dbURL string) map[string]string {
+	out := maps.Clone(env)
+	out["TW_DATABASE_URL"] = dbURL
+	return out
 }
 
 // syncBuffer is a bytes.Buffer that is safe for concurrent writes.
@@ -78,28 +93,38 @@ func TestConfigErrors(t *testing.T) {
 		env  map[string]string
 		want string
 		is   error
+		// db leaves out -no-budgets.
+		db bool
 	}{
-		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set", nil},
-		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set", nil},
-		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL", nil},
-		{"no keys flag", nil, env, "-keys is required", nil},
-		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "-keys", fs.ErrNotExist},
-		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file", nil},
-		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field", nil},
-		{"zero keys", []string{"-keys", writeFile(t, `{"keys":[]}`)}, env, "holds no keys", nil},
-		{"addr without port", []string{"-keys", good, "-addr", "127.0.0.1"}, env, "-addr", nil},
-		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number", nil},
-		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number", nil},
-		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr", nil},
-		{"unknown flag", []string{"-keys", good, "-bogus"}, env, "flag provided but not defined: -bogus", errUsage},
-		{"extra argument", []string{"-keys", good, "serve"}, env, `unexpected argument "serve"`, errUsage},
+		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set", nil, false},
+		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set", nil, false},
+		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL", nil, false},
+		{"no keys flag", nil, env, "-keys is required", nil, false},
+		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "-keys", fs.ErrNotExist, false},
+		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file", nil, false},
+		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field", nil, false},
+		{"zero keys", []string{"-keys", writeFile(t, `{"keys":[]}`)}, env, "holds no keys", nil, false},
+		{"addr without port", []string{"-keys", good, "-addr", "127.0.0.1"}, env, "-addr", nil, false},
+		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number", nil, false},
+		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number", nil, false},
+		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr", nil, false},
+		{"unknown flag", []string{"-keys", good, "-bogus"}, env, "flag provided but not defined: -bogus", errUsage, false},
+		{"extra argument", []string{"-keys", good, "serve"}, env, `unexpected argument "serve"`, errUsage, false},
+		{"no database", []string{"-keys", good}, env, "TW_DATABASE_URL is not set", nil, true},
+		{"database and no-budgets", []string{"-keys", good, "-no-budgets"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "both set", nil, true},
+		{"bad database URL", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@[::1/tw"), "not a valid Postgres connection string", nil, true},
+		{"database down", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "budget database", nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			args := tt.args
+			if !tt.db {
+				args = append([]string{"-no-budgets"}, args...)
+			}
 			var stderr bytes.Buffer
-			cfg, err := parseConfig(tt.args, envOf(tt.env), &stderr)
+			cfg, err := parseConfig(args, envOf(tt.env), &stderr)
 			if err == nil {
-				_, _, err = handlers(cfg, slog.New(slog.DiscardHandler))
+				_, _, _, err = handlers(t.Context(), cfg, slog.New(slog.DiscardHandler))
 			}
 			if err == nil {
 				t.Fatal("error = nil")
@@ -118,8 +143,10 @@ func TestConfigErrors(t *testing.T) {
 			if !strings.Contains(text, tt.want) {
 				t.Fatalf("error = %v, stderr = %q, want %q", err, stderr.String(), tt.want)
 			}
-			if strings.Contains(err.Error(), upstreamKey) {
-				t.Fatalf("error holds the upstream key: %v", err)
+			for _, secret := range []string{upstreamKey, dbPassword} {
+				if strings.Contains(err.Error()+stderr.String(), secret) {
+					t.Fatalf("error holds a secret: %v", err)
+				}
 			}
 		})
 	}
@@ -143,7 +170,9 @@ type gatewayUnderTest struct {
 	upstream *httptest.Server
 }
 
-func startGateway(t *testing.T) *gatewayUnderTest {
+// startGateway starts the gateway. An empty dbURL runs it with
+// -no-budgets.
+func startGateway(t *testing.T, dbURL string) *gatewayUnderTest {
 	t.Helper()
 	m := mock.New(mock.Config{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -155,26 +184,42 @@ func startGateway(t *testing.T) *gatewayUnderTest {
 	}))
 	t.Cleanup(upstream.Close)
 	env := map[string]string{"TW_UPSTREAM_URL": upstream.URL, "TW_UPSTREAM_KEY": upstreamKey}
-	cfg, err := parseConfig([]string{"-keys", keyFile(t)}, envOf(env), io.Discard)
+	args := []string{"-keys", keyFile(t)}
+	if dbURL == "" {
+		args = append(args, "-no-budgets")
+	} else {
+		env = withDB(env, dbURL)
+	}
+	cfg, err := parseConfig(args, envOf(env), io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
 	logs := &syncBuffer{}
-	proxy, metrics, err := handlers(cfg, slog.New(slog.NewJSONHandler(logs, nil)))
+	proxy, metrics, closeDB, err := handlers(t.Context(), cfg, slog.New(slog.NewJSONHandler(logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(closeDB)
 	srv := httptest.NewServer(proxy)
 	t.Cleanup(srv.Close)
 	return &gatewayUnderTest{proxy: srv, metrics: metrics, logs: logs, upstream: upstream}
 }
 
-// send posts one Messages API request and returns the status and body.
+// send posts one Messages API request with max_tokens 32 and returns the
+// status and body.
 func (g *gatewayUnderTest) send(t *testing.T, stream bool) (int, string) {
+	t.Helper()
+	code, _, body := g.sendMax(t, stream, 32)
+	return code, body
+}
+
+// sendMax posts one Messages API request and returns the status, the
+// response header, and the body.
+func (g *gatewayUnderTest) sendMax(t *testing.T, stream bool, maxTokens int) (int, http.Header, string) {
 	t.Helper()
 	body, err := json.Marshal(map[string]any{
 		"model":      "claude-test",
-		"max_tokens": 32,
+		"max_tokens": maxTokens,
 		"stream":     stream,
 		"messages":   []map[string]string{{"role": "user", "content": "hello gateway"}},
 	})
@@ -197,7 +242,30 @@ func (g *gatewayUnderTest) send(t *testing.T, stream bool) (int, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return res.StatusCode, string(b)
+	return res.StatusCode, res.Header, string(b)
+}
+
+// fault sets a fault on the mock upstream.
+func (g *gatewayUnderTest) fault(t *testing.T, f mock.Fault) {
+	t.Helper()
+	b, err := json.Marshal(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, g.upstream.URL+"/_faults", bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("x-api-key", upstreamKey)
+	req.Header.Set("content-type", "application/json")
+	res, err := g.upstream.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode/100 != 2 {
+		t.Fatalf("POST /_faults = %d", res.StatusCode)
+	}
 }
 
 // get sends GET path to the proxy and returns the status and body.
@@ -231,7 +299,7 @@ func (g *gatewayUnderTest) scrape(t *testing.T) string {
 }
 
 func TestEndToEnd(t *testing.T) {
-	g := startGateway(t)
+	g := startGateway(t, "")
 
 	code, body := g.send(t, true)
 	if code != http.StatusOK || !strings.Contains(body, "event: message_stop") {
@@ -293,16 +361,83 @@ func TestEndToEnd(t *testing.T) {
 // so a renamed, added, or removed metric fails until the docs follow.
 func TestDocsMatchMetrics(t *testing.T) {
 	doc := readDoc(t)
-	g := startGateway(t)
+	g := startBudgetGateway(t)
 	if code, body := g.send(t, true); code != http.StatusOK {
 		t.Fatalf("stream reply = %d:\n%s", code, body)
 	}
+	// A CounterVec with no series is not exported, so make the budget
+	// metrics count.
+	exceedBudget(t, g)
 	g.proxy.Close()
 
 	live := uniqueMatches(regexp.MustCompile(`(?m)^# TYPE (tokenwarden_\w+) `), g.scrape(t))
 	documented := uniqueMatches(regexp.MustCompile("`(tokenwarden_[a-z_]+)`"), doc)
 	if !slices.Equal(live, documented) {
 		t.Fatalf("metrics in docs/tokenwarden.md = %v, live metrics = %v", documented, live)
+	}
+}
+
+// startBudgetGateway starts the gateway on a new, empty database schema,
+// which the gateway must migrate, and then gives team red a budget of 600
+// tokens per hour.
+func startBudgetGateway(t *testing.T) *gatewayUnderTest {
+	t.Helper()
+	dbURL := pgtest.URL(t)
+	g := startGateway(t, dbURL)
+	pool, err := pgxpool.New(t.Context(), dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if err := postgres.New(pool).SetBudget(t.Context(), "red", limit.Budget{Tokens: 600, Window: time.Hour}); err != nil {
+		t.Fatalf("SetBudget after the gateway started: %v", err)
+	}
+	return g
+}
+
+// exceedBudget runs team red, with a budget of 600 tokens, past its
+// budget twice: a long stream that a top-up cuts, and a request that the
+// first reserve refuses.
+func exceedBudget(t *testing.T, g *gatewayUnderTest) {
+	t.Helper()
+	// The first hold is the input guess plus 512 output tokens, which
+	// fits in 600; the second 512 does not.
+	g.fault(t, mock.Fault{LongReply: true, Count: 1})
+	code, _, body := g.sendMax(t, true, 2000)
+	if code != http.StatusOK || !strings.Contains(body, "event: error") ||
+		!strings.Contains(body, `"rate_limit_error"`) || strings.Contains(body, "event: message_stop") {
+		t.Fatalf("long stream = %d, want 200 cut by a rate_limit_error event:\n%s", code, body)
+	}
+	code, header, body := g.sendMax(t, false, 1000)
+	if code != http.StatusTooManyRequests || !strings.Contains(body, `"rate_limit_error"`) {
+		t.Fatalf("over-budget request = %d, want 429 rate_limit_error:\n%s", code, body)
+	}
+	if ra, err := strconv.Atoi(header.Get("Retry-After")); err != nil || ra < 1 || ra > 3600 {
+		t.Fatalf("Retry-After = %q, want 1 to 3600 seconds", header.Get("Retry-After"))
+	}
+}
+
+func TestBudgets(t *testing.T) {
+	g := startBudgetGateway(t)
+	if code, body := g.send(t, false); code != http.StatusOK {
+		t.Fatalf("in-budget request = %d:\n%s", code, body)
+	}
+	exceedBudget(t, g)
+	g.proxy.Close()
+
+	text := g.scrape(t)
+	for _, want := range []string{
+		`tokenwarden_budget_denials_total{stage="reserve",team="red"} 1`,
+		`tokenwarden_budget_denials_total{stage="topup",team="red"} 1`,
+		`tokenwarden_requests_total{outcome="budget_exceeded",stream="false"} 1`,
+		`tokenwarden_topups_total{result="exceeded"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+	if strings.Contains(g.logs.String(), dbPassword) {
+		t.Error("logs hold the database password")
 	}
 }
 
@@ -349,7 +484,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}
-	args := []string{"-keys", keyFile(t), "-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}
+	args := []string{"-no-budgets", "-keys", keyFile(t), "-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}
 	var stderr syncBuffer
 	if err := run(ctx, args, envOf(env), &stderr); err != nil {
 		t.Fatalf("run = %v", err)
@@ -377,7 +512,7 @@ func TestRunFailsOnBusyPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}
-	args := []string{"-keys", keyFile(t), "-addr", proxyAddr, "-metrics-addr", busy.Addr().String()}
+	args := []string{"-no-budgets", "-keys", keyFile(t), "-addr", proxyAddr, "-metrics-addr", busy.Addr().String()}
 	if err := run(t.Context(), args, envOf(env), io.Discard); err == nil {
 		t.Fatal("run on a busy metrics port = nil, want an error")
 	}

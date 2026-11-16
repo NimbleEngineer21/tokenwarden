@@ -9,6 +9,7 @@ package pgtest
 import (
 	"context"
 	"crypto/rand"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -24,18 +25,37 @@ const EnvURL = "TW_TEST_DATABASE_URL"
 // use only that schema, and drops the schema when the test ends.
 func New(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	url := os.Getenv(EnvURL)
-	if url == "" {
+	pool, err := pgxpool.New(t.Context(), URL(t))
+	if err != nil {
+		t.Fatalf("pgtest: open pool: %v", err)
+	}
+	// Registered after the schema cleanup, so it runs first: open
+	// connections must close before the schema drops.
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// URL creates a schema with a random name and returns a connection URL
+// whose connections use only that schema. The schema drops when the test
+// ends; close every connection to it before then.
+func URL(t *testing.T) string {
+	t.Helper()
+	raw := os.Getenv(EnvURL)
+	if raw == "" {
 		if os.Getenv("CI") == "true" {
 			t.Fatalf("%s is not set; CI must run the Postgres tests", EnvURL)
 		}
 		t.Skipf("%s is not set; run make test-pg", EnvURL)
 	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		t.Fatalf("pgtest: %s must be a postgres:// URL", EnvURL)
+	}
 	ctx := t.Context()
 	schema := "tw_test_" + strings.ToLower(rand.Text())
 	ident := pgx.Identifier{schema}.Sanitize()
 
-	admin, err := pgx.Connect(ctx, url)
+	admin, err := pgx.Connect(ctx, raw)
 	if err != nil {
 		t.Fatalf("pgtest: connect: %v", err)
 	}
@@ -52,17 +72,10 @@ func New(t *testing.T) *pgxpool.Pool {
 		_ = admin.Close(ctx)
 	})
 
-	cfg, err := pgxpool.ParseConfig(url)
-	if err != nil {
-		t.Fatalf("pgtest: parse %s: %v", EnvURL, err)
-	}
-	cfg.ConnConfig.RuntimeParams["search_path"] = schema
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		t.Fatalf("pgtest: open pool: %v", err)
-	}
-	// Registered after the schema cleanup, so it runs first: open
-	// connections must close before the schema drops.
-	t.Cleanup(pool.Close)
-	return pool
+	// pgx sends an unknown URL parameter to the server as a run-time
+	// setting.
+	q := u.Query()
+	q.Set("search_path", schema)
+	u.RawQuery = q.Encode()
+	return u.String()
 }

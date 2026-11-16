@@ -1,8 +1,9 @@
 #!/bin/sh
 # Smoke test for deploy/compose.yaml: start the stack, send one stream and one
 # non-stream request through each gateway replica, check the audit lines and
-# the metrics, check that the internal ports are not published, then stop the
-# stack. Needs Docker with Compose v2 and curl. Run it from the repo root.
+# the metrics, run team blue past its token budget, check that the internal
+# ports are not published, then stop the stack. Needs Docker with Compose v2
+# and curl. Run it from the repo root.
 set -eu
 
 compose() { docker compose -f deploy/compose.yaml "$@"; }
@@ -38,13 +39,37 @@ for r in $replicas; do
 	done
 done
 echo "smoke: both replicas are healthy"
+compose wait seed >/dev/null || fail "the seed service failed"
+echo "smoke: the budgets are seeded"
 
-send() { # port stream
-	curl -fsSN -m 30 "http://127.0.0.1:$1/v1/messages" \
-		-H "x-api-key: $key" \
+request() { # port key stream max_tokens [curl options]
+	# sh has no local variables; the names must not clash with the callers'.
+	r_port=$1 r_key=$2 r_stream=$3 r_max=$4
+	shift 4
+	curl -sSN -m 60 "$@" "http://127.0.0.1:$r_port/v1/messages" \
+		-H "x-api-key: $r_key" \
 		-H 'anthropic-version: 2023-06-01' \
 		-H 'content-type: application/json' \
-		-d "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":32,\"stream\":$2,\"messages\":[{\"role\":\"user\",\"content\":\"smoke\"}]}"
+		-d "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":$r_max,\"stream\":$r_stream,\"messages\":[{\"role\":\"user\",\"content\":\"smoke\"}]}"
+}
+send() { request "$1" "$key" "$2" 32 -f; } # port stream
+
+# wait_audit fails unless the logs of service $1 get an audit line that
+# matches each of the other arguments.
+wait_audit() {
+	w_svc=$1
+	shift
+	w_n=0
+	while :; do
+		w_lines=$(compose logs --no-color --no-log-prefix "$w_svc" | grep '"msg":"audit"') || true
+		for w_m in "$@"; do
+			w_lines=$(echo "$w_lines" | grep -F -- "$w_m") || true
+		done
+		[ -z "$w_lines" ] || return 0
+		w_n=$((w_n + 1))
+		[ "$w_n" -lt 10 ] || fail "$w_svc: no audit line with $*"
+		sleep 1
+	done
 }
 
 for r in $replicas; do
@@ -63,14 +88,7 @@ for r in $replicas; do
 	# The gateway writes the audit line after the handler returns, which can
 	# be after the client has the whole reply.
 	for s in true false; do
-		n=0
-		until compose logs --no-color --no-log-prefix "$svc" |
-			grep '"msg":"audit"' | grep '"team":"red"' |
-			grep "\"stream\":$s," | grep -q '"outcome":"ok"'; do
-			n=$((n + 1))
-			[ "$n" -lt 10 ] || fail "$svc: no ok audit line for stream=$s"
-			sleep 1
-		done
+		wait_audit "$svc" '"team":"red"' "\"stream\":$s," '"outcome":"ok"'
 	done
 	logs=$(compose logs --no-color --no-log-prefix "$svc")
 	# The key must never reach the logs.
@@ -86,6 +104,35 @@ for r in $replicas; do
 	echo "smoke: $svc passed"
 done
 
+# Team blue has 600 tokens per minute (deploy/budgets.sql).
+blue=tw_test_blue_bob
+
+# The first hold, input plus max_tokens, does not fit: 429 with Retry-After.
+headers=$(request 8080 "$blue" false 1000 -o /dev/null -D -) ||
+	fail "the over-budget request failed"
+echo "$headers" | grep -q '^HTTP/[0-9.]* 429' ||
+	fail "the over-budget request did not get 429:
+$headers"
+echo "$headers" | grep -Eqi '^retry-after: [0-9]+' ||
+	fail "the 429 reply has no Retry-After:
+$headers"
+wait_audit gateway-a '"team":"blue"' '"stream":false,' '"outcome":"budget_exceeded"'
+echo "smoke: an over-budget request gets 429 with Retry-After"
+
+# A long stream fits its first hold of 512 output tokens, but not the
+# second, so the gateway cuts it with an error event.
+probe -f -X POST http://mock:8081/_faults -H 'x-api-key: sk-ant-test-mock' \
+	-H 'content-type: application/json' -d '{"long_reply":true,"count":1}' >/dev/null ||
+	fail "could not set the long_reply fault"
+reply=$(request 8080 "$blue" true 2000 -f) || fail "the long stream request failed"
+echo "$reply" | grep -q '^event: error' && echo "$reply" | grep -q '"rate_limit_error"' ||
+	fail "the long stream has no rate_limit_error event"
+if echo "$reply" | grep -q '^event: message_stop'; then
+	fail "the long stream was not cut"
+fi
+wait_audit gateway-a '"team":"blue"' '"stream":true,' '"outcome":"budget_exceeded"'
+echo "smoke: a stream past the budget is cut with a rate_limit_error event"
+
 # Only the proxy ports may be published, and only on 127.0.0.1. Ask Compose,
 # not the host: another local process can hold 9090 or 8081. `compose port`
 # is not usable here: for a port that the image exposes but nothing
@@ -95,7 +142,8 @@ published=$(compose ps --format \
 	sort)
 want='gateway-a 127.0.0.1:8080->8080
 gateway-b 127.0.0.1:8082->8080
-mock'
+mock
+postgres'
 [ "$published" = "$want" ] ||
 	fail "unexpected published ports:
 $published"

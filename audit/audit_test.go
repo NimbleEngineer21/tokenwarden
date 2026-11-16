@@ -34,8 +34,8 @@ func TestSlogRecord(t *testing.T) {
 		t.Fatalf("log line %q: %v", buf.String(), err)
 	}
 	wantKeys := []string{
-		"duration", "error_type", "key_id", "level", "model", "msg", "outcome", "request_id",
-		"status", "stream", "team", "time", "upstream_request_id", "usage", "user",
+		"duration", "error_type", "event_time", "key_id", "level", "model", "msg", "outcome",
+		"request_id", "status", "stream", "team", "time", "upstream_request_id", "usage", "user",
 	}
 	keys := make([]string, 0, len(got))
 	for k := range got {
@@ -47,11 +47,19 @@ func TestSlogRecord(t *testing.T) {
 	}
 	for k, want := range map[string]any{
 		"msg": "audit", "level": "INFO", "team": "red", "outcome": "ok", "status": 200.0,
-		"stream": true, "time": "2026-11-05T12:00:00Z", "duration": 1.5e9,
+		"stream": true, "event_time": "2026-11-05T12:00:00Z", "duration": 1.5e9,
 	} {
 		if got[k] != want {
 			t.Errorf("%s = %v, want %v", k, got[k], want)
 		}
+	}
+	// A decoder that keeps one value per key must still see both times.
+	logged, _ := got["time"].(string)
+	if ts, err := time.Parse(time.RFC3339Nano, logged); err != nil || ts.Equal(ev.Time) {
+		t.Errorf("time = %q, want the record time, apart from event_time", logged)
+	}
+	if dup := duplicateKey(t, buf.Bytes()); dup != "" {
+		t.Errorf("log line has key %q twice: %s", dup, buf.String())
 	}
 	u, _ := got["usage"].(map[string]any)
 	for k, want := range map[string]float64{
@@ -61,4 +69,31 @@ func TestSlogRecord(t *testing.T) {
 			t.Errorf("usage.%s = %v, want %v", k, u[k], want)
 		}
 	}
+}
+
+// duplicateKey returns the first top-level key that appears twice in the JSON
+// object line, or "" when every key is unique. A map decode cannot see this.
+func duplicateKey(t *testing.T, line []byte) string {
+	t.Helper()
+	dec := json.NewDecoder(bytes.NewReader(line))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		t.Fatalf("log line %q: want a JSON object", line)
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, _ := tok.(string)
+		if seen[key] {
+			return key
+		}
+		seen[key] = true
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ""
 }

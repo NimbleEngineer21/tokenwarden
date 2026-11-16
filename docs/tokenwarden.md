@@ -186,5 +186,6 @@ interface.
 
 The gateway writes JSON logs to stderr. Each request to `/v1/messages` gives
 one line with `"msg":"audit"`. The line holds the request IDs, `key_id`,
-team, user, model, status, outcome, token usage, and duration. The gateway
-never logs a key, an `Authorization` value, or prompt or reply text.
+team, user, model, status, outcome, token usage, and duration. `time` is when
+the gateway wrote the line. `event_time` is when the request started. The
+gateway never logs a key, an `Authorization` value, or prompt or reply text.

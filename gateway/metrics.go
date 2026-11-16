@@ -14,6 +14,8 @@ type metrics struct {
 	duration *prometheus.HistogramVec
 	active   prometheus.Gauge
 	tokens   *prometheus.CounterVec
+	topUps   *prometheus.CounterVec
+	denials  *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer) (*metrics, error) {
@@ -36,12 +38,20 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "tokenwarden_tokens_total",
 			Help: "Tokens that the upstream reported, by team and kind.",
 		}, []string{"team", "kind"}),
+		topUps: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tokenwarden_topups_total",
+			Help: "Stream top-ups by result: ok, exceeded, or error.",
+		}, []string{"result"}),
+		denials: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tokenwarden_budget_denials_total",
+			Help: "Requests that the token budget stopped, by team and stage: reserve or topup.",
+		}, []string{"team", "stage"}),
 	}
 	if reg == nil {
 		return m, nil
 	}
 	var errs []error
-	for _, c := range []prometheus.Collector{m.requests, m.duration, m.active, m.tokens} {
+	for _, c := range []prometheus.Collector{m.requests, m.duration, m.active, m.tokens, m.topUps, m.denials} {
 		errs = append(errs, reg.Register(c))
 	}
 	if err := errors.Join(errs...); err != nil {

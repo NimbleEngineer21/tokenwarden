@@ -87,15 +87,19 @@ func (s *stack) event(t *testing.T) *audit.Event {
 }
 
 // newStack starts the mock upstream at full speed and a gateway that sends
-// key upstream.
-func newStack(t *testing.T, key string) *stack {
+// key upstream. Each opt changes the gateway config.
+func newStack(t *testing.T, key string, opts ...func(*Config)) *stack {
 	t.Helper()
 	sp := &spy{next: mock.New(mock.Config{})}
 	ms := httptest.NewServer(sp)
 	t.Cleanup(ms.Close)
 	rec := make(chanRecorder, 16)
 	reg := prometheus.NewRegistry()
-	h, err := New(Config{UpstreamURL: ms.URL, UpstreamKey: key, Authenticator: newAuth(t), Recorder: rec, Registerer: reg})
+	cfg := Config{UpstreamURL: ms.URL, UpstreamKey: key, Authenticator: newAuth(t), Recorder: rec, Registerer: reg}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	h, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

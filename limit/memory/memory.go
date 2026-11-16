@@ -102,7 +102,7 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 		teamWindows[w.Start] = c
 	}
 	if !fits(c, tokens, b.Tokens) {
-		return nil, fmt.Errorf("memory: team %q: reserve %d tokens: %w", team, tokens, limit.ErrBudgetExceeded)
+		return nil, fmt.Errorf("memory: reserve: %w", &limit.ExceededError{Team: team, Tokens: tokens, Window: w})
 	}
 	c.reserved += tokens
 	c.open++
@@ -163,7 +163,7 @@ func (r *reservation) TopUp(ctx context.Context, tokens int64) error {
 		return fmt.Errorf("memory: top up: %w", limit.ErrReservationClosed)
 	}
 	if !fits(r.c, tokens, r.budget) {
-		return fmt.Errorf("memory: team %q: top up %d tokens: %w", r.team, tokens, limit.ErrBudgetExceeded)
+		return fmt.Errorf("memory: top up: %w", &limit.ExceededError{Team: r.team, Tokens: tokens, Window: r.window})
 	}
 	r.c.reserved += tokens
 	r.held += tokens

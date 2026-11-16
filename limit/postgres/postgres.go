@@ -108,7 +108,7 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 		WindowUs:    b.WindowUs,
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("postgres: team %q: reserve %d tokens: %w", team, tokens, limit.ErrBudgetExceeded)
+		return nil, fmt.Errorf("postgres: reserve: %w", &limit.ExceededError{Team: team, Tokens: tokens, Window: w})
 	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres: team %q: reserve %d tokens: %w", team, tokens, err)
@@ -154,7 +154,7 @@ func (r *reservation) TopUp(ctx context.Context, tokens int64) error {
 	case !res.Open:
 		return fmt.Errorf("postgres: top up: %w", limit.ErrReservationClosed)
 	case !res.Granted:
-		return fmt.Errorf("postgres: team %q: top up %d tokens: %w", r.team, tokens, limit.ErrBudgetExceeded)
+		return fmt.Errorf("postgres: top up: %w", &limit.ExceededError{Team: r.team, Tokens: tokens, Window: r.window})
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

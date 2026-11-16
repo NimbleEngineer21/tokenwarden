@@ -220,6 +220,22 @@ replies:
 | A stream needs a hold that does not fit. | The stream ends with a `rate_limit_error` event in place of the next delta. |
 | The database fails. | 503 `api_error`, or an `api_error` event in a stream. The gateway fails closed. |
 
+### Leases
+
+Each hold has a 30-second lease. The replica that holds it renews the lease
+every 10 seconds until the reply ends. If a replica stops before a reply
+ends, for example in a crash, its leases end. Within about 40 seconds, any
+replica then reaps the holds: it counts their held tokens as used, since
+the requests may have used them upstream. Each reap gives a `WARN` log line
+and adds to the `tokenwarden_reaped_*` metrics. A stream that the shutdown
+grace period cuts is reaped the same way if its replica stopped first.
+
+Replica clocks must agree to well within the shortest budget window and the
+lease length.
+
+The gateway deletes the usage counts of a window 7 days after the window
+ends.
+
 ## Endpoints
 
 | Listener | Path | Purpose |
@@ -244,6 +260,8 @@ interface.
 | `tokenwarden_tokens_total` | counter | `team`, `kind` | Tokens that the upstream reported. `kind` is one of `input`, `output`, `cache_creation`, `cache_read`. |
 | `tokenwarden_budget_denials_total` | counter | `team`, `stage` | Requests that the token budget stopped. `stage` is `reserve` (429 or 403 before the upstream call) or `topup` (a stream cut). |
 | `tokenwarden_topups_total` | counter | `result` | Stream holds after the first one. `result` is one of `ok`, `exceeded`, `error`. |
+| `tokenwarden_reaped_reservations_total` | counter | none | Holds that the gateway reaped after their lease ended. Only with budgets on. |
+| `tokenwarden_reaped_tokens_total` | counter | none | Tokens that the reaped holds held. They count as used. Only with budgets on. |
 
 ## Logs
 

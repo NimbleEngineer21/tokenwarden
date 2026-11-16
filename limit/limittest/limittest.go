@@ -128,6 +128,14 @@ func assertTeamRemaining(t *testing.T, l limit.Limiter, team string, want int64)
 	}
 }
 
+// sameWindow reports whether a and b start at the same instant and have the
+// same length. It does not use ==, which also compares the time zone and
+// the monotonic clock reading: a limiter that reads the start back from a
+// database can return the same instant in another time zone.
+func sameWindow(a, b limit.Window) bool {
+	return a.Start.Equal(b.Start) && a.Length == b.Length
+}
+
 // errAny marks an expected error that must match no sentinel of the limit
 // package, such as an argument error.
 var errAny = errors.New("any error that is no sentinel")
@@ -182,7 +190,7 @@ func (s suite) testReserve(t *testing.T) {
 			if got := r.Reserved(); got != tt.tokens {
 				t.Errorf("Reserved() = %d, want %d", got, tt.tokens)
 			}
-			if got, want := r.Window(), limit.WindowOf(c.now(), window); got != want {
+			if got, want := r.Window(), limit.WindowOf(c.now(), window); !sameWindow(got, want) {
 				t.Errorf("Window() = %v, want %v", got, want)
 			}
 		})
@@ -306,7 +314,7 @@ func (s suite) testRolloverSettlesInStartWindow(t *testing.T) {
 	ctx := t.Context()
 	r := mustReserve(t, l, 70)
 	first := limit.WindowOf(start, window)
-	if got := r.Window(); got != first {
+	if got := r.Window(); !sameWindow(got, first) {
 		t.Fatalf("Window() = %v, want %v", got, first)
 	}
 
@@ -320,7 +328,7 @@ func (s suite) testRolloverSettlesInStartWindow(t *testing.T) {
 	if err := r.Settle(ctx, 100); err != nil {
 		t.Fatalf("Settle: %v", err)
 	}
-	if got := r.Window(); got != first {
+	if got := r.Window(); !sameWindow(got, first) {
 		t.Errorf("Window() after rollover = %v, want %v", got, first)
 	}
 	assertRemaining(t, l, 100)

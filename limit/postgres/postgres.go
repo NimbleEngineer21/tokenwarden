@@ -7,6 +7,13 @@
 // of the replica, not from the database clock; replica clocks must agree to
 // well within a window length.
 //
+// Each reservation has a lease. The replica that holds it renews the lease
+// while the reservation is open, from [Limiter.Run]. When a replica stops
+// without settling, for example in a crash, its leases end and the Run loop
+// of any replica reaps the reservations: it charges their held tokens to
+// their windows, since the requests may have used them upstream. Leases use
+// the Go clock too.
+//
 // The database must have the tokenwarden schema; [Migrate] creates it.
 package postgres
 
@@ -14,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -36,9 +44,25 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool) error {
 // Limiter is a [limit.Limiter] backed by Postgres. It is safe for
 // concurrent use, and any number of Limiters can share one database.
 type Limiter struct {
-	q   *db.Queries
-	now func() time.Time
+	pool      *pgxpool.Pool
+	q         *db.Queries
+	now       func() time.Time
+	ttl       time.Duration
+	retention time.Duration
+	onReap    func(reservations int, tokens int64)
+	log       *slog.Logger
+
+	// open holds the ids of this limiter's open reservations, whose leases
+	// Run renews.
+	mu   sync.Mutex
+	open map[int64]struct{}
 }
+
+// Defaults of the lease options.
+const (
+	DefaultLeaseTTL  = 30 * time.Second
+	DefaultRetention = 7 * 24 * time.Hour
+)
 
 // Option configures a [Limiter].
 type Option func(*Limiter)
@@ -54,9 +78,55 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
+// WithLeaseTTL sets how long a reservation's lease lasts without a renewal.
+// Run renews leases and reaps ended ones every third of it, so a stopped
+// replica's reservations are reaped between ttl and 4/3 ttl after its last
+// renewal. Values below one millisecond keep [DefaultLeaseTTL].
+func WithLeaseTTL(ttl time.Duration) Option {
+	return func(l *Limiter) {
+		if ttl >= time.Millisecond {
+			l.ttl = ttl
+		}
+	}
+}
+
+// WithRetention sets how long Run keeps the usage counts of a window after
+// the window ends. A negative value keeps [DefaultRetention].
+func WithRetention(d time.Duration) Option {
+	return func(l *Limiter) {
+		if d >= 0 {
+			l.retention = d
+		}
+	}
+}
+
+// WithReapFunc makes Run call f after it reaps reservations, with how many
+// it reaped and the tokens that they held. A nil f calls nothing.
+func WithReapFunc(f func(reservations int, tokens int64)) Option {
+	return func(l *Limiter) { l.onReap = f }
+}
+
+// WithLogger makes Run log reaps and failures to log. A nil log keeps
+// [slog.Default].
+func WithLogger(log *slog.Logger) Option {
+	return func(l *Limiter) {
+		if log != nil {
+			l.log = log
+		}
+	}
+}
+
 // New returns a limiter that uses pool.
 func New(pool *pgxpool.Pool, opts ...Option) *Limiter {
-	l := &Limiter{q: db.New(pool), now: time.Now}
+	l := &Limiter{
+		pool:      pool,
+		q:         db.New(pool),
+		now:       time.Now,
+		ttl:       DefaultLeaseTTL,
+		retention: DefaultRetention,
+		log:       slog.Default(),
+		open:      make(map[int64]struct{}),
+	}
 	for _, opt := range opts {
 		opt(l)
 	}
@@ -103,7 +173,8 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	if err != nil {
 		return nil, fmt.Errorf("postgres: team %q: read budget: %w", team, err)
 	}
-	w := limit.WindowOf(l.now(), time.Duration(b.WindowUs)*time.Microsecond)
+	now := l.now()
+	w := limit.WindowOf(now, time.Duration(b.WindowUs)*time.Microsecond)
 
 	err = l.q.EnsureWindow(ctx, db.EnsureWindowParams{Team: team, WindowStart: w.Start, WindowUs: b.WindowUs})
 	if err != nil {
@@ -112,6 +183,7 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	id, err := l.q.Reserve(ctx, db.ReserveParams{
 		Budget:      b.Tokens,
 		Tokens:      tokens,
+		ExpiresAt:   now.Add(l.ttl),
 		Team:        team,
 		WindowStart: w.Start,
 		WindowUs:    b.WindowUs,
@@ -122,11 +194,23 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	if err != nil {
 		return nil, fmt.Errorf("postgres: team %q: reserve %d tokens: %w", team, tokens, err)
 	}
-	return &reservation{q: l.q, id: id, team: team, window: w, held: tokens}, nil
+	l.track(id, true)
+	return &reservation{l: l, id: id, team: team, window: w, held: tokens}, nil
+}
+
+// track adds id to or drops it from the reservations that Run renews.
+func (l *Limiter) track(id int64, open bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if open {
+		l.open[id] = struct{}{}
+	} else {
+		delete(l.open, id)
+	}
 }
 
 type reservation struct {
-	q      *db.Queries
+	l      *Limiter
 	id     int64
 	team   string
 	window limit.Window
@@ -156,11 +240,13 @@ func (r *reservation) TopUp(ctx context.Context, tokens int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	res, err := r.q.TopUp(ctx, db.TopUpParams{ID: r.id, Tokens: tokens})
+	res, err := r.l.q.TopUp(ctx, db.TopUpParams{ID: r.id, Tokens: tokens, ExpiresAt: r.l.now().Add(r.l.ttl)})
 	switch {
 	case err != nil:
 		return fmt.Errorf("postgres: team %q: top up %d tokens: %w", r.team, tokens, err)
 	case !res.Open:
+		// Settled, or reaped after its lease ended.
+		r.l.track(r.id, false)
 		return fmt.Errorf("postgres: top up: %w", limit.ErrReservationClosed)
 	case !res.Granted:
 		return fmt.Errorf("postgres: top up: %w", &limit.ExceededError{Team: r.team, Tokens: tokens, Window: r.window})
@@ -175,12 +261,15 @@ func (r *reservation) TopUp(ctx context.Context, tokens int64) error {
 	return nil
 }
 
-// Settle implements [limit.Reservation].
+// Settle implements [limit.Reservation]. After any Settle, Run stops
+// renewing the lease: a reservation whose settle failed is reaped, so its
+// tokens do not stay held for good.
 func (r *reservation) Settle(ctx context.Context, used int64) error {
 	if used < 0 {
 		return fmt.Errorf("postgres: settle %d tokens: must not be negative", used)
 	}
-	_, err := r.q.Settle(ctx, db.SettleParams{ID: r.id, Used: used})
+	defer r.l.track(r.id, false)
+	_, err := r.l.q.Settle(ctx, db.SettleParams{ID: r.id, Used: used})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("postgres: settle: %w", limit.ErrReservationClosed)
 	}

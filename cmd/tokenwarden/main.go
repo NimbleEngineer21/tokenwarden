@@ -192,7 +192,7 @@ func loadKeys(path string) (*auth.Static, error) {
 // openLimiter connects to the budget database, migrates it, and returns a
 // limiter on it and a func that closes the connections. The error never
 // holds the database URL, which can hold a password.
-func openLimiter(ctx context.Context, dbURL string) (*postgres.Limiter, func(), error) {
+func openLimiter(ctx context.Context, dbURL string, opts ...postgres.Option) (*postgres.Limiter, func(), error) {
 	pcfg, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
 		return nil, nil, errors.New("TW_DATABASE_URL is not a valid Postgres connection string")
@@ -207,7 +207,25 @@ func openLimiter(ctx context.Context, dbURL string) (*postgres.Limiter, func(), 
 		pool.Close()
 		return nil, nil, fmt.Errorf("budget database: %w", err)
 	}
-	return postgres.New(pool), pool.Close, nil
+	return postgres.New(pool, opts...), pool.Close, nil
+}
+
+// startLeases starts the limiter's lease loop and returns a func that stops
+// it and then closes the database. The loop outlives ctx, the signal
+// context, so that it renews the leases of the requests that run during the
+// shutdown grace period.
+func startLeases(ctx context.Context, l *postgres.Limiter, closePool func()) func() {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		l.Run(ctx)
+	}()
+	return func() {
+		cancel()
+		<-done
+		closePool()
+	}
 }
 
 // handlers returns the proxy handler, the metrics handler, and a func that
@@ -231,11 +249,27 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 	if cfg.noBudgets {
 		log.WarnContext(ctx, "token budgets are off (-no-budgets)")
 	} else {
-		l, closePool, err := openLimiter(ctx, cfg.databaseURL)
+		reaped := prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tokenwarden_reaped_reservations_total",
+			Help: "Reservations reaped after their lease ended.",
+		})
+		reapedTokens := prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "tokenwarden_reaped_tokens_total",
+			Help: "Tokens that reaped reservations held, charged to their windows.",
+		})
+		if err := errors.Join(reg.Register(reaped), reg.Register(reapedTokens)); err != nil {
+			return nil, nil, nil, err
+		}
+		l, closePool, err := openLimiter(ctx, cfg.databaseURL,
+			postgres.WithLogger(log),
+			postgres.WithReapFunc(func(n int, tokens int64) {
+				reaped.Add(float64(n))
+				reapedTokens.Add(float64(tokens))
+			}))
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		limiter, closeDB = l, closePool
+		limiter, closeDB = l, startLeases(ctx, l, closePool)
 	}
 	gw, err := gateway.New(gateway.Config{
 		UpstreamURL:   cfg.upstreamURL,

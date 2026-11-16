@@ -10,6 +10,87 @@ import (
 	"time"
 )
 
+const chargeHeld = `-- name: ChargeHeld :exec
+UPDATE usage_windows u
+SET reserved = u.reserved - $1::bigint,
+    settled = LEAST(u.settled, 9223372036854775807 - $1::bigint) + $1::bigint
+WHERE u.team = $2
+  AND u.window_start = $3
+  AND u.window_us = $4
+`
+
+type ChargeHeldParams struct {
+	Held        int64
+	Team        string
+	WindowStart time.Time
+	WindowUs    int64
+}
+
+// ChargeHeld moves tokens of reaped reservations from reserved to settled
+// in one window. settled saturates as in Settle.
+func (q *Queries) ChargeHeld(ctx context.Context, arg ChargeHeldParams) error {
+	_, err := q.db.Exec(ctx, chargeHeld,
+		arg.Held,
+		arg.Team,
+		arg.WindowStart,
+		arg.WindowUs,
+	)
+	return err
+}
+
+const claimExpired = `-- name: ClaimExpired :many
+DELETE FROM reservations res
+WHERE res.id IN (
+    SELECT x.id FROM reservations x
+    WHERE x.expires_at < $1::timestamptz
+    ORDER BY x.id
+    LIMIT $2::int
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING res.team, res.window_start, res.window_us, res.held
+`
+
+type ClaimExpiredParams struct {
+	Now     time.Time
+	MaxRows int32
+}
+
+type ClaimExpiredRow struct {
+	Team        string
+	WindowStart time.Time
+	WindowUs    int64
+	Held        int64
+}
+
+// ClaimExpired deletes up to max_rows reservations whose lease ended before
+// now and returns them. SKIP LOCKED lets replicas reap at the same time
+// without waiting for each other, and leaves alone a reservation that a
+// Settle or TopUp holds.
+func (q *Queries) ClaimExpired(ctx context.Context, arg ClaimExpiredParams) ([]ClaimExpiredRow, error) {
+	rows, err := q.db.Query(ctx, claimExpired, arg.Now, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimExpiredRow
+	for rows.Next() {
+		var i ClaimExpiredRow
+		if err := rows.Scan(
+			&i.Team,
+			&i.WindowStart,
+			&i.WindowUs,
+			&i.Held,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const ensureWindow = `-- name: EnsureWindow :exec
 INSERT INTO usage_windows (team, window_start, window_us)
 VALUES ($1, $2, $3)
@@ -43,24 +124,64 @@ func (q *Queries) GetBudget(ctx context.Context, team string) (GetBudgetRow, err
 	return i, err
 }
 
+const pruneWindows = `-- name: PruneWindows :execrows
+DELETE FROM usage_windows u
+WHERE u.window_start + u.window_us * interval '1 microsecond' <= $1::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM reservations r
+      WHERE r.team = u.team
+        AND r.window_start = u.window_start
+        AND r.window_us = u.window_us
+  )
+`
+
+// PruneWindows deletes the windows that ended at or before the given time
+// and that no reservation holds.
+func (q *Queries) PruneWindows(ctx context.Context, endedBy time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneWindows, endedBy)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const renewLeases = `-- name: RenewLeases :exec
+UPDATE reservations res
+SET expires_at = GREATEST(res.expires_at, $1::timestamptz)
+WHERE res.id = ANY($2::bigint[])
+`
+
+type RenewLeasesParams struct {
+	ExpiresAt time.Time
+	Ids       []int64
+}
+
+// RenewLeases extends the leases of open reservations. It never shortens a
+// lease, so a replica whose clock is behind cannot end one early.
+func (q *Queries) RenewLeases(ctx context.Context, arg RenewLeasesParams) error {
+	_, err := q.db.Exec(ctx, renewLeases, arg.ExpiresAt, arg.Ids)
+	return err
+}
+
 const reserve = `-- name: Reserve :one
 WITH w AS (
     UPDATE usage_windows u
     SET reserved = u.reserved + $2::bigint
-    WHERE u.team = $3
-      AND u.window_start = $4
-      AND u.window_us = $5
+    WHERE u.team = $4
+      AND u.window_start = $5
+      AND u.window_us = $6
       AND $2::bigint <= $1::bigint - u.settled - u.reserved
     RETURNING u.team, u.window_start, u.window_us
 )
-INSERT INTO reservations (team, window_start, window_us, budget, held)
-SELECT w.team, w.window_start, w.window_us, $1::bigint, $2::bigint FROM w
+INSERT INTO reservations (team, window_start, window_us, budget, held, expires_at)
+SELECT w.team, w.window_start, w.window_us, $1::bigint, $2::bigint, $3::timestamptz FROM w
 RETURNING id
 `
 
 type ReserveParams struct {
 	Budget      int64
 	Tokens      int64
+	ExpiresAt   time.Time
 	Team        string
 	WindowStart time.Time
 	WindowUs    int64
@@ -73,6 +194,7 @@ func (q *Queries) Reserve(ctx context.Context, arg ReserveParams) (int64, error)
 	row := q.db.QueryRow(ctx, reserve,
 		arg.Budget,
 		arg.Tokens,
+		arg.ExpiresAt,
 		arg.Team,
 		arg.WindowStart,
 		arg.WindowUs,
@@ -131,7 +253,8 @@ WITH r AS (
     RETURNING r.id
 ), h AS (
     UPDATE reservations res
-    SET held = res.held + $2::bigint
+    SET held = res.held + $2::bigint,
+        expires_at = GREATEST(res.expires_at, $3::timestamptz)
     WHERE res.id IN (SELECT w.id FROM w)
     RETURNING res.id
 )
@@ -141,8 +264,9 @@ SELECT
 `
 
 type TopUpParams struct {
-	ID     int64
-	Tokens int64
+	ID        int64
+	Tokens    int64
+	ExpiresAt time.Time
 }
 
 type TopUpRow struct {
@@ -150,12 +274,12 @@ type TopUpRow struct {
 	Granted bool
 }
 
-// TopUp holds more tokens for an open reservation in its own window. It
-// locks the reservation first, as Settle does, so that the two cannot
-// deadlock. open is false when the reservation has settled; granted is
+// TopUp holds more tokens for an open reservation in its own window and
+// extends its lease. It locks the reservation first, as Settle does, so
+// that the two cannot deadlock. open is false when the reservation has settled; granted is
 // false when the tokens do not fit.
 func (q *Queries) TopUp(ctx context.Context, arg TopUpParams) (TopUpRow, error) {
-	row := q.db.QueryRow(ctx, topUp, arg.ID, arg.Tokens)
+	row := q.db.QueryRow(ctx, topUp, arg.ID, arg.Tokens, arg.ExpiresAt)
 	var i TopUpRow
 	err := row.Scan(&i.Open, &i.Granted)
 	return i, err

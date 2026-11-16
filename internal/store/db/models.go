@@ -22,6 +22,7 @@ type Reservation struct {
 	Budget      int64
 	Held        int64
 	CreatedAt   time.Time
+	ExpiresAt   time.Time
 }
 
 type UsageWindow struct {

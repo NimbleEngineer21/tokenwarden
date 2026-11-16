@@ -25,13 +25,13 @@ WITH w AS (
       AND sqlc.arg(tokens)::bigint <= sqlc.arg(budget)::bigint - u.settled - u.reserved
     RETURNING u.team, u.window_start, u.window_us
 )
-INSERT INTO reservations (team, window_start, window_us, budget, held)
-SELECT w.team, w.window_start, w.window_us, @budget::bigint, @tokens::bigint FROM w
+INSERT INTO reservations (team, window_start, window_us, budget, held, expires_at)
+SELECT w.team, w.window_start, w.window_us, @budget::bigint, @tokens::bigint, @expires_at::timestamptz FROM w
 RETURNING id;
 
--- TopUp holds more tokens for an open reservation in its own window. It
--- locks the reservation first, as Settle does, so that the two cannot
--- deadlock. open is false when the reservation has settled; granted is
+-- TopUp holds more tokens for an open reservation in its own window and
+-- extends its lease. It locks the reservation first, as Settle does, so
+-- that the two cannot deadlock. open is false when the reservation has settled; granted is
 -- false when the tokens do not fit.
 -- name: TopUp :one
 WITH r AS (
@@ -50,7 +50,8 @@ WITH r AS (
     RETURNING r.id
 ), h AS (
     UPDATE reservations res
-    SET held = res.held + @tokens::bigint
+    SET held = res.held + @tokens::bigint,
+        expires_at = GREATEST(res.expires_at, @expires_at::timestamptz)
     WHERE res.id IN (SELECT w.id FROM w)
     RETURNING res.id
 )
@@ -76,3 +77,47 @@ WHERE u.team = r.team
   AND u.window_start = r.window_start
   AND u.window_us = r.window_us
 RETURNING u.settled;
+
+-- RenewLeases extends the leases of open reservations. It never shortens a
+-- lease, so a replica whose clock is behind cannot end one early.
+-- name: RenewLeases :exec
+UPDATE reservations res
+SET expires_at = GREATEST(res.expires_at, @expires_at::timestamptz)
+WHERE res.id = ANY(@ids::bigint[]);
+
+-- ClaimExpired deletes up to max_rows reservations whose lease ended before
+-- now and returns them. SKIP LOCKED lets replicas reap at the same time
+-- without waiting for each other, and leaves alone a reservation that a
+-- Settle or TopUp holds.
+-- name: ClaimExpired :many
+DELETE FROM reservations res
+WHERE res.id IN (
+    SELECT x.id FROM reservations x
+    WHERE x.expires_at < @now::timestamptz
+    ORDER BY x.id
+    LIMIT sqlc.arg(max_rows)::int
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING res.team, res.window_start, res.window_us, res.held;
+
+-- ChargeHeld moves tokens of reaped reservations from reserved to settled
+-- in one window. settled saturates as in Settle.
+-- name: ChargeHeld :exec
+UPDATE usage_windows u
+SET reserved = u.reserved - @held::bigint,
+    settled = LEAST(u.settled, 9223372036854775807 - @held::bigint) + @held::bigint
+WHERE u.team = @team
+  AND u.window_start = @window_start
+  AND u.window_us = @window_us;
+
+-- PruneWindows deletes the windows that ended at or before the given time
+-- and that no reservation holds.
+-- name: PruneWindows :execrows
+DELETE FROM usage_windows u
+WHERE u.window_start + u.window_us * interval '1 microsecond' <= @ended_by::timestamptz
+  AND NOT EXISTS (
+      SELECT 1 FROM reservations r
+      WHERE r.team = u.team
+        AND r.window_start = u.window_start
+        AND r.window_us = u.window_us
+  );

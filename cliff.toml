@@ -7,7 +7,10 @@ header = """
 All notable changes to this project are documented in this file.
 The format follows Conventional Commits; versions follow Semantic Versioning.
 """
+# trim removes leading whitespace, so the blank line after the header is
+# printed from inside the template.
 body = """
+{{ "" }}
 {% if version %}\
 ## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
 {% else %}\
@@ -18,7 +21,7 @@ body = """
 {% for commit in commits %}
 - {% if commit.scope %}**{{ commit.scope }}:** {% endif %}{{ commit.message | upper_first }}\
 {% endfor %}
-{% endfor %}\n
+{% endfor %}
 """
 trim = true
 
@@ -30,7 +33,13 @@ protect_breaking_commits = true
 filter_commits = false
 tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+"
 sort_commits = "oldest"
+# A rendered CHANGELOG.md does not autolink "#N", so link squash-merge PR
+# numbers explicitly.
+commit_preprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/NimbleEngineer21/tokenwarden/pull/${1}))" },
+]
 commit_parsers = [
+  { message = "^chore: initial commit$", skip = true },
   { message = "^feat", group = "<!-- 0 -->Features" },
   { message = "^fix", group = "<!-- 1 -->Bug fixes" },
   { message = "^perf", group = "<!-- 2 -->Performance" },

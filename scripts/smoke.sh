@@ -39,7 +39,12 @@ for r in $replicas; do
 	done
 done
 echo "smoke: both replicas are healthy"
-compose wait seed >/dev/null || fail "the seed service failed"
+# Older Compose releases (the CI runner) skip exited containers in
+# "compose wait", and seed may finish before this line. "docker wait" works
+# on a stopped container and prints its exit code.
+seed_id=$(compose ps -aq seed)
+[ -n "$seed_id" ] || fail "the seed service has no container"
+[ "$(docker wait "$seed_id")" = 0 ] || fail "the seed service failed"
 echo "smoke: the budgets are seeded"
 
 request() { # port key stream max_tokens [curl options]

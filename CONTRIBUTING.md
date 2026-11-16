@@ -25,7 +25,8 @@ make setup
 | `commit-msg` | Conventional Commit subject |
 | `pre-push` | `go mod tidy`, build, tests with `-race` |
 
-Run every check that CI runs with `make check`.
+Run every check that CI runs with `make check`, and `make test-pg` for the
+Postgres tests.
 
 ## Code style
 
@@ -45,8 +46,12 @@ Run every check that CI runs with `make check`.
 
 - Run `make test`. Tests always use the race detector.
 - Use `testing/synctest` for code that depends on time.
-- Integration tests that need Postgres read `TOKENWARDEN_TEST_DATABASE_URL` and
-  skip when it is not set.
+- Tests that need Postgres read `TW_TEST_DATABASE_URL`. They skip when it is
+  not set, except under `CI=true`, where they fail. `make test-pg` runs every
+  test against a throwaway Postgres in Docker. CI always runs them.
+- After a change to `internal/store/migrations` or `internal/store/queries`,
+  run `make generate` and commit the sqlc output. `make lint` fails when it
+  is out of date.
 
 ## Commits and branches
 

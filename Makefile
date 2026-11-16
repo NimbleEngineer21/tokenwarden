@@ -19,11 +19,20 @@ fmt: ## Format code.
 .PHONY: lint
 lint: ## Run linters.
 	mise exec -- golangci-lint run ./...
+	mise exec -- sqlc diff
 	if [ -d .github/workflows ]; then mise exec -- actionlint; fi
 
 .PHONY: test
 test: ## Run tests with the race detector.
 	$(GO) test -race -count=1 ./...
+
+.PHONY: test-pg
+test-pg: ## Run tests with a throwaway Postgres. Needs Docker.
+	scripts/test-pg.sh
+
+.PHONY: generate
+generate: ## Regenerate the sqlc query code.
+	mise exec -- sqlc generate
 
 .PHONY: build
 build: ## Build all packages.

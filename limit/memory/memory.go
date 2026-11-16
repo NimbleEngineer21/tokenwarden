@@ -18,6 +18,7 @@ import (
 // Limiter is an in-process [limit.Limiter]. It is safe for concurrent use.
 type Limiter struct {
 	budgets map[string]limit.Budget
+	now     func() time.Time
 
 	mu sync.Mutex
 	// windows maps team, then window start, to that window's counter.
@@ -32,13 +33,31 @@ type counter struct {
 	open int
 }
 
+// Option configures a [Limiter].
+type Option func(*Limiter)
+
+// WithClock makes the limiter read the time from now instead of
+// [time.Now]. The time picks the window of each new reservation. A nil now
+// keeps [time.Now].
+func WithClock(now func() time.Time) Option {
+	return func(l *Limiter) {
+		if now != nil {
+			l.now = now
+		}
+	}
+}
+
 // New returns a limiter that enforces budgets, keyed by team. It returns an
 // error for an empty team name or a budget whose tokens or window is not
 // positive.
-func New(budgets map[string]limit.Budget) (*Limiter, error) {
+func New(budgets map[string]limit.Budget, opts ...Option) (*Limiter, error) {
 	l := &Limiter{
 		budgets: make(map[string]limit.Budget, len(budgets)),
+		now:     time.Now,
 		windows: make(map[string]map[time.Time]*counter, len(budgets)),
+	}
+	for _, opt := range opts {
+		opt(l)
 	}
 	for team, b := range budgets {
 		switch {
@@ -66,7 +85,7 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	if !ok {
 		return nil, fmt.Errorf("memory: team %q: %w", team, limit.ErrNoBudget)
 	}
-	now := time.Now()
+	now := l.now()
 	w := limit.WindowOf(now, b.Window)
 
 	l.mu.Lock()

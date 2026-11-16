@@ -1,12 +1,13 @@
 // Command tokenwarden is the reference gateway. It proxies the Anthropic
-// Messages API, authenticates clients with gateway keys from a key file, and
-// writes one audit log line per request.
+// Messages API, authenticates clients with gateway keys from a key file,
+// enforces each team's token budget, and writes one audit log line per
+// request.
 //
 // The upstream URL and key come from the environment variables
-// TW_UPSTREAM_URL and TW_UPSTREAM_KEY, never from flags, so that the key does
-// not show in the process list or in shell history. Prometheus metrics are
-// served on a separate listener, never on the proxy port. See
-// docs/tokenwarden.md.
+// TW_UPSTREAM_URL and TW_UPSTREAM_KEY, and the budget database from
+// TW_DATABASE_URL, never from flags, so that no secret shows in the process
+// list or in shell history. Prometheus metrics are served on a separate
+// listener, never on the proxy port. See docs/tokenwarden.md.
 package main
 
 import (
@@ -24,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -31,11 +33,16 @@ import (
 	"github.com/NimbleEngineer21/tokenwarden/audit"
 	"github.com/NimbleEngineer21/tokenwarden/auth"
 	"github.com/NimbleEngineer21/tokenwarden/gateway"
+	"github.com/NimbleEngineer21/tokenwarden/limit"
+	"github.com/NimbleEngineer21/tokenwarden/limit/postgres"
 )
 
 // shutdownGrace is how long open requests can run after a stop signal.
 // Streams that are still open after it are cut.
 const shutdownGrace = 10 * time.Second
+
+// dbStartTimeout bounds the database connect and migration at start.
+const dbStartTimeout = 30 * time.Second
 
 // errUsage means that the command line was wrong and the usage text is
 // already printed.
@@ -68,6 +75,8 @@ type config struct {
 	keysPath    string
 	upstreamURL string
 	upstreamKey string
+	databaseURL string
+	noBudgets   bool
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) error {
@@ -79,10 +88,11 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return err
 	}
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
-	proxy, metrics, err := handlers(cfg, log)
+	proxy, metrics, closeDB, err := handlers(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
+	defer closeDB()
 	var lc net.ListenConfig
 	proxyLn, err := lc.Listen(ctx, "tcp", cfg.addr)
 	if err != nil {
@@ -104,6 +114,7 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8080", "proxy listen address")
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", "127.0.0.1:9090", "metrics listen address; must use a port other than -addr")
 	fs.StringVar(&cfg.keysPath, "keys", "", "JSON key file of SHA-256 gateway key hashes (required)")
+	fs.BoolVar(&cfg.noBudgets, "no-budgets", false, "enforce no token budgets; required when TW_DATABASE_URL is not set")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return config{}, err
@@ -117,6 +128,7 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	}
 	cfg.upstreamURL = getenv("TW_UPSTREAM_URL")
 	cfg.upstreamKey = getenv("TW_UPSTREAM_KEY")
+	cfg.databaseURL = getenv("TW_DATABASE_URL")
 	switch {
 	case cfg.upstreamURL == "":
 		return config{}, errors.New("TW_UPSTREAM_URL is not set")
@@ -124,6 +136,11 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 		return config{}, errors.New("TW_UPSTREAM_KEY is not set")
 	case cfg.keysPath == "":
 		return config{}, errors.New("-keys is required")
+	// A gateway without budgets must be a choice, never a missing variable.
+	case cfg.databaseURL == "" && !cfg.noBudgets:
+		return config{}, errors.New("TW_DATABASE_URL is not set; set it, or pass -no-budgets to run without token budgets")
+	case cfg.databaseURL != "" && cfg.noBudgets:
+		return config{}, errors.New("-no-budgets and TW_DATABASE_URL are both set; use one")
 	}
 	proxyPort, err := port(cfg.addr)
 	if err != nil {
@@ -172,19 +189,53 @@ func loadKeys(path string) (*auth.Static, error) {
 	return s, nil
 }
 
-// handlers returns the proxy handler and the metrics handler. Each call has
-// its own metrics registry.
-func handlers(cfg config, log *slog.Logger) (proxy, metrics http.Handler, err error) {
+// openLimiter connects to the budget database, migrates it, and returns a
+// limiter on it and a func that closes the connections. The error never
+// holds the database URL, which can hold a password.
+func openLimiter(ctx context.Context, dbURL string) (*postgres.Limiter, func(), error) {
+	pcfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		return nil, nil, errors.New("TW_DATABASE_URL is not a valid Postgres connection string")
+	}
+	ctx, cancel := context.WithTimeout(ctx, dbStartTimeout)
+	defer cancel()
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		return nil, nil, fmt.Errorf("budget database: %w", err)
+	}
+	if err := postgres.Migrate(ctx, pool); err != nil {
+		pool.Close()
+		return nil, nil, fmt.Errorf("budget database: %w", err)
+	}
+	return postgres.New(pool), pool.Close, nil
+}
+
+// handlers returns the proxy handler, the metrics handler, and a func that
+// closes the budget database. Each call has its own metrics registry.
+func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics http.Handler, closeDB func(), err error) {
 	keys, err := loadKeys(cfg.keysPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	reg := prometheus.NewRegistry()
 	if err := errors.Join(
 		reg.Register(collectors.NewGoCollector()),
 		reg.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})),
 	); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+	// A nil interface, not a nil *postgres.Limiter: the gateway checks the
+	// interface for nil.
+	var limiter limit.Limiter
+	closeDB = func() {}
+	if cfg.noBudgets {
+		log.WarnContext(ctx, "token budgets are off (-no-budgets)")
+	} else {
+		l, closePool, err := openLimiter(ctx, cfg.databaseURL)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		limiter, closeDB = l, closePool
 	}
 	gw, err := gateway.New(gateway.Config{
 		UpstreamURL:   cfg.upstreamURL,
@@ -193,11 +244,13 @@ func handlers(cfg config, log *slog.Logger) (proxy, metrics http.Handler, err er
 		Logger:        log,
 		Recorder:      audit.NewSlog(log),
 		Registerer:    reg,
+		Limiter:       limiter,
 	})
 	if err != nil {
-		return nil, nil, err
+		closeDB()
+		return nil, nil, nil, err
 	}
-	log.Info("loaded gateway keys", "count", keys.Len())
+	log.InfoContext(ctx, "loaded gateway keys", "count", keys.Len())
 
 	pm := http.NewServeMux()
 	pm.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -208,7 +261,7 @@ func handlers(cfg config, log *slog.Logger) (proxy, metrics http.Handler, err er
 
 	mm := http.NewServeMux()
 	mm.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	return pm, mm, nil
+	return pm, mm, closeDB, nil
 }
 
 // servers returns the HTTP servers for the proxy and metrics handlers.

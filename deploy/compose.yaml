@@ -1,10 +1,13 @@
-# Two gateway replicas and the mock upstream. See docs/tokenwarden.md.
+# Two gateway replicas, the mock upstream, and Postgres for the shared token
+# budgets. See docs/tokenwarden.md.
 #
 #   docker compose -f deploy/compose.yaml up --build
 #
 # Only the gateway proxy ports are published, and only on 127.0.0.1. The mock
-# (its /_faults API has no auth) and the metrics listeners (the metrics carry
-# team names) stay on Docker networks.
+# (its /_faults API has no auth), Postgres, and the metrics listeners (the
+# metrics carry team names) stay on Docker networks.
+#
+# DEMO ONLY: the Postgres password below is fixed and public.
 #
 # --profile real adds two more gateways that use https://api.anthropic.com
 # with ANTHROPIC_API_KEY from deploy/.env. They cannot reach the mock, so the
@@ -27,6 +30,12 @@ x-gateway: &gateway
   # The gateway lets open streams run for 10 s after SIGTERM.
   stop_grace_period: 15s
 
+x-postgres-image: &postgres-image
+  # postgres:18.7
+  image: postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+
+x-database-url: &database-url postgres://tokenwarden:tw_test_pgdemo@postgres:5432/tokenwarden?sslmode=disable
+
 services:
   mock:
     build:
@@ -38,21 +47,74 @@ services:
     security_opt: ["no-new-privileges:true"]
     networks: [internal]
 
+  postgres:
+    <<: *postgres-image
+    environment:
+      POSTGRES_USER: tokenwarden
+      POSTGRES_PASSWORD: tw_test_pgdemo
+      POSTGRES_DB: tokenwarden
+    volumes:
+      - pgdata:/var/lib/postgresql
+    security_opt: ["no-new-privileges:true"]
+    # TCP, not the socket: during the first start, a temporary server
+    # listens on the socket only.
+    healthcheck:
+      test: ["CMD", "pg_isready", "-q", "-h", "127.0.0.1", "-U", "tokenwarden", "-d", "tokenwarden"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    networks: [db]
+
+  # Sets the demo budgets once a gateway has created the schema, then exits.
+  seed:
+    <<: *postgres-image
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        i=0
+        until [ "$$(psql -tAc "SELECT to_regclass('budgets') IS NOT NULL")" = t ]; do
+          i=$$((i + 1))
+          [ "$$i" -lt 60 ] || { echo "seed: no budgets table after 60 s" >&2; exit 1; }
+          sleep 1
+        done
+        psql -v ON_ERROR_STOP=1 -f /seed/budgets.sql
+    environment:
+      PGHOST: postgres
+      PGUSER: tokenwarden
+      PGPASSWORD: tw_test_pgdemo
+      PGDATABASE: tokenwarden
+    volumes:
+      - ./budgets.sql:/seed/budgets.sql:ro
+    user: postgres
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: "no"
+    networks: [db]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   gateway-a:
     <<: *gateway
     environment: &mock-upstream
       TW_UPSTREAM_URL: http://mock:8081
       TW_UPSTREAM_KEY: sk-ant-test-mock
+      TW_DATABASE_URL: *database-url
     ports: ["127.0.0.1:8080:8080"]
-    networks: [internal, edge]
-    depends_on: [mock]
+    networks: [internal, edge, db]
+    depends_on: &gateway-deps
+      mock:
+        condition: service_started
+      postgres:
+        condition: service_healthy
 
   gateway-b:
     <<: *gateway
     environment: *mock-upstream
     ports: ["127.0.0.1:8082:8080"]
-    networks: [internal, edge]
-    depends_on: [mock]
+    networks: [internal, edge, db]
+    depends_on: *gateway-deps
 
   gateway-a-real:
     <<: *gateway
@@ -61,15 +123,20 @@ services:
       TW_UPSTREAM_URL: https://api.anthropic.com
       # Empty when unset: the gateway then refuses to start.
       TW_UPSTREAM_KEY: ${ANTHROPIC_API_KEY:-}
+      TW_DATABASE_URL: *database-url
     ports: ["127.0.0.1:8180:8080"]
-    networks: [edge]
+    networks: [edge, db]
+    depends_on: &real-deps
+      postgres:
+        condition: service_healthy
 
   gateway-b-real:
     <<: *gateway
     profiles: [real]
     environment: *real-upstream
     ports: ["127.0.0.1:8182:8080"]
-    networks: [edge]
+    networks: [edge, db]
+    depends_on: *real-deps
 
   # Reads /healthz and /metrics from inside the networks:
   #   docker compose -f deploy/compose.yaml run --rm probe -s http://gateway-a:9090/metrics
@@ -79,9 +146,15 @@ services:
     profiles: [tools]
     networks: [internal, edge]
 
+volumes:
+  pgdata: {}
+
 networks:
   # No route out of the host. The mock lives only here.
   internal:
     internal: true
   # Carries the published proxy ports and the real gateways' egress.
   edge: {}
+  # Postgres and the gateways. No route out, and no route to the mock.
+  db:
+    internal: true

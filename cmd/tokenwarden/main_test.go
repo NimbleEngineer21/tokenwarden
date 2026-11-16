@@ -388,6 +388,55 @@ func TestRunFailsOnBusyPort(t *testing.T) {
 	again.Close()
 }
 
+// TestServeWaitsForServeStartedAfterShutdown holds each Serve call until
+// Shutdown has begun, so Shutdown has no listener to close. serve must not
+// return before those Serve calls end and close their listeners.
+func TestServeWaitsForServeStartedAfterShutdown(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var all []served
+		// The hooks go in before serve starts; a hook registered after
+		// Shutdown never runs.
+		shutdownStarted := map[*http.Server]chan struct{}{}
+		for _, name := range []string{"proxy", "metrics"} {
+			srv := &http.Server{Handler: http.NotFoundHandler(), ReadHeaderTimeout: time.Second}
+			started := make(chan struct{})
+			srv.RegisterOnShutdown(func() { close(started) })
+			shutdownStarted[srv] = started
+			all = append(all, served{name, srv, newPipeListener()})
+		}
+		release := make(chan struct{})
+		orig := serveHTTP
+		t.Cleanup(func() { serveHTTP = orig })
+		serveHTTP = func(srv *http.Server, ln net.Listener) error {
+			<-shutdownStarted[srv]
+			<-release
+			return srv.Serve(ln)
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		errc := make(chan error, 1)
+		go func() { errc <- serve(ctx, slog.New(slog.DiscardHandler), all) }()
+		synctest.Wait()
+		select {
+		case err := <-errc:
+			close(release)
+			t.Fatalf("serve returned (%v) before its Serve calls ended", err)
+		default:
+		}
+		close(release)
+		if err := <-errc; err != nil {
+			t.Fatalf("serve = %v", err)
+		}
+		for _, s := range all {
+			select {
+			case <-s.ln.(*pipeListener).done:
+			default:
+				t.Errorf("%s listener still open after serve returned", s.name)
+			}
+		}
+	})
+}
+
 func TestServeShutsDownBothListeners(t *testing.T) {
 	var (
 		lc  net.ListenConfig

@@ -41,6 +41,10 @@ const shutdownGrace = 10 * time.Second
 // already printed.
 var errUsage = errors.New("usage error")
 
+// serveHTTP starts one server. Tests replace it to start Serve late, which
+// the scheduler does only rarely.
+var serveHTTP = (*http.Server).Serve
+
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	// After the first signal, restore the default handling, so that a second
@@ -234,15 +238,17 @@ type served struct {
 // serve runs each server until ctx is done or one server fails. Then it
 // shuts all of them down, and after [shutdownGrace] it cuts the open
 // requests. Cutting requests at the end of the grace period is normal, not
-// an error.
+// an error. serve returns only after every listener is closed.
 func serve(ctx context.Context, log *slog.Logger, all []served) error {
 	errc := make(chan error, len(all))
 	for _, s := range all {
-		go func() { errc <- s.srv.Serve(s.ln) }()
+		go func() { errc <- serveHTTP(s.srv, s.ln) }()
 	}
 	var serveErr error
+	pending := len(all)
 	select {
 	case serveErr = <-errc:
+		pending--
 	case <-ctx.Done():
 	}
 	// ctx can be done already; the grace period needs a live context.
@@ -264,6 +270,14 @@ func serve(ctx context.Context, log *slog.Logger, all []served) error {
 	}
 	for range all {
 		<-done
+	}
+	// Shutdown closes only the listeners that Serve already tracks. A Serve
+	// call that starts after Shutdown closes its own listener and returns, so
+	// wait for each one; otherwise a listener can outlive serve.
+	for range pending {
+		if err := <-errc; serveErr == nil || errors.Is(serveErr, http.ErrServerClosed) {
+			serveErr = err
+		}
 	}
 	if errors.Is(serveErr, http.ErrServerClosed) {
 		serveErr = nil

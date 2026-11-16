@@ -24,6 +24,7 @@ import (
 	"github.com/NimbleEngineer21/tokenwarden/audit"
 	"github.com/NimbleEngineer21/tokenwarden/auth"
 	"github.com/NimbleEngineer21/tokenwarden/internal/anthropic"
+	"github.com/NimbleEngineer21/tokenwarden/limit"
 )
 
 // maxRequestBytes is the request size limit of the Messages API.
@@ -63,6 +64,12 @@ type Config struct {
 	// Registerer receives the gateway's Prometheus collectors. Nil keeps the
 	// metrics unregistered.
 	Registerer prometheus.Registerer
+	// Limiter enforces the token budget of each team. Nil enforces no
+	// budgets. With a limiter, a request must have a positive max_tokens.
+	Limiter limit.Limiter
+	// Estimator guesses the tokens to hold before the upstream reports
+	// them. Nil uses [limit.ByteEstimator]. It is used only with a Limiter.
+	Estimator limit.Estimator
 }
 
 // gateway is the handler that [New] returns.
@@ -74,6 +81,8 @@ type gateway struct {
 	log      *slog.Logger
 	rec      audit.Recorder
 	metrics  *metrics
+	limiter  limit.Limiter
+	est      limit.Estimator
 	mux      *http.ServeMux
 }
 
@@ -118,10 +127,15 @@ func New(cfg Config) (http.Handler, error) {
 		log:      cfg.Logger,
 		rec:      cfg.Recorder,
 		metrics:  m,
+		limiter:  cfg.Limiter,
+		est:      cfg.Estimator,
 		mux:      http.NewServeMux(),
 	}
 	if g.log == nil {
 		g.log = slog.New(slog.DiscardHandler)
+	}
+	if g.est == nil {
+		g.est = limit.ByteEstimator{}
 	}
 	g.mux.HandleFunc("POST /v1/messages", g.handleMessages)
 	g.mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
@@ -191,6 +205,14 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	ev.Model, ev.Stream = p.Model, p.Stream
 	log = log.With("model", p.Model, "stream", p.Stream)
 
+	var b *budget
+	if g.limiter != nil {
+		if b = g.reserve(ctx, w, ev, body, p.Stream, log); b == nil {
+			return
+		}
+		defer b.settle(ctx, ev, log)
+	}
+
 	up := *g.upstream
 	up.RawQuery = r.URL.RawQuery
 	ureq, err := http.NewRequestWithContext(ctx, http.MethodPost, up.String(), bytes.NewReader(body))
@@ -243,7 +265,7 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode < 300 && isEventStream(resp.Header.Get("Content-Type")) {
 		g.metrics.active.Inc()
 		defer g.metrics.active.Dec()
-		relayStream(ctx, w, resp, log, ev)
+		relayStream(ctx, w, resp, log, ev, b, g.metrics)
 		return
 	}
 	relayWhole(ctx, w, resp, log, ev)

@@ -36,6 +36,11 @@ const (
 	// OutcomeCanceled means that the client went away before the reply
 	// ended.
 	OutcomeCanceled Outcome = "canceled"
+	// OutcomeBudgetExceeded means that the team's token budget stopped the
+	// request: a 429 when the request did not fit, a 403 when the team has
+	// no budget, or status 200 and an error event when a stream was cut
+	// off because a top-up did not fit.
+	OutcomeBudgetExceeded Outcome = "budget_exceeded"
 )
 
 // Usage holds the token counts that the upstream reported.

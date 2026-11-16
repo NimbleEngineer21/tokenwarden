@@ -15,12 +15,33 @@ package limit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
 // ErrBudgetExceeded means that the tokens asked for do not fit in what is
 // left of the team's budget for the window.
 var ErrBudgetExceeded = errors.New("limit: token budget exceeded")
+
+// ExceededError is the error that a [Limiter] or a [Reservation] returns
+// when the tokens asked for do not fit in the budget. It wraps
+// [ErrBudgetExceeded].
+type ExceededError struct {
+	Team   string
+	Tokens int64
+	// Window is the window whose budget is used up. A new window, with a
+	// full budget, starts at its end.
+	Window Window
+}
+
+// Error implements the error interface.
+func (e *ExceededError) Error() string {
+	return fmt.Sprintf("team %q: %d tokens do not fit in the window that ends %s: %v",
+		e.Team, e.Tokens, e.Window.End().Format(time.RFC3339), ErrBudgetExceeded)
+}
+
+// Unwrap returns [ErrBudgetExceeded].
+func (e *ExceededError) Unwrap() error { return ErrBudgetExceeded }
 
 // ErrNoBudget means that the team has no budget. A [Limiter] fails closed
 // for such a team: it reserves nothing.
@@ -69,7 +90,7 @@ func (w Window) End() time.Time {
 // concurrent use.
 type Limiter interface {
 	// Reserve holds tokens in the team's current window. It returns an
-	// error that wraps [ErrBudgetExceeded] when settled plus reserved plus
+	// error that wraps an [*ExceededError] when settled plus reserved plus
 	// tokens would pass the budget, and one that wraps [ErrNoBudget] when
 	// the team has no budget. tokens must be positive.
 	Reserve(ctx context.Context, team string, tokens int64) (Reservation, error)
@@ -84,7 +105,7 @@ type Reservation interface {
 	// Reserved returns the number of tokens held now.
 	Reserved() int64
 	// TopUp holds more tokens in the reservation's own window. It returns
-	// an error that wraps [ErrBudgetExceeded] when they do not fit; the
+	// an error that wraps an [*ExceededError] when they do not fit; the
 	// reservation then stays open and must still be settled. tokens must
 	// be positive.
 	TopUp(ctx context.Context, tokens int64) error
@@ -98,3 +119,26 @@ type Reservation interface {
 	// settle.
 	Settle(ctx context.Context, used int64) error
 }
+
+// Estimator guesses token counts before the upstream reports the real ones.
+// A guess that is too high holds budget that the settle step frees; a guess
+// that is too low lets a reply pass its budget until the next top-up.
+type Estimator interface {
+	// InputTokens returns the input tokens of a Messages API request body.
+	InputTokens(body []byte) int64
+	// OutputTokens returns the tokens of n bytes of generated text.
+	OutputTokens(n int64) int64
+}
+
+// ByteEstimator is an [Estimator] that counts one token for each four bytes,
+// rounded up. On a request body it counts the JSON syntax and field names
+// too, so its input guess is high.
+type ByteEstimator struct{}
+
+// InputTokens implements [Estimator].
+func (ByteEstimator) InputTokens(body []byte) int64 { return ceilQuarter(int64(len(body))) }
+
+// OutputTokens implements [Estimator].
+func (ByteEstimator) OutputTokens(n int64) int64 { return ceilQuarter(n) }
+
+func ceilQuarter(n int64) int64 { return n/4 + min(n%4, 1) }

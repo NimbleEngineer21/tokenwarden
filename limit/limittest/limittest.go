@@ -159,6 +159,21 @@ func checkErr(t *testing.T, err, want error) {
 	}
 }
 
+// checkExceeded fails unless err wraps an [*limit.ExceededError] that names
+// team, tokens, and window w.
+func checkExceeded(t *testing.T, err error, team string, tokens int64, w limit.Window) {
+	t.Helper()
+	var e *limit.ExceededError
+	switch {
+	case !errors.As(err, &e):
+		t.Fatalf("err = %v, want an *limit.ExceededError", err)
+	case !errors.Is(err, limit.ErrBudgetExceeded):
+		t.Fatalf("err = %v does not match ErrBudgetExceeded", err)
+	case e.Team != team || e.Tokens != tokens || !sameWindow(e.Window, w):
+		t.Fatalf("ExceededError = {%q %d %v}, want {%q %d %v}", e.Team, e.Tokens, e.Window, team, tokens, w)
+	}
+}
+
 func (s suite) testReserve(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -184,6 +199,9 @@ func (s suite) testReserve(t *testing.T) {
 			}
 			r, err := l.Reserve(t.Context(), tt.team, tt.tokens)
 			checkErr(t, err, tt.wantErr)
+			if errors.Is(tt.wantErr, limit.ErrBudgetExceeded) {
+				checkExceeded(t, err, tt.team, tt.tokens, limit.WindowOf(c.now(), window))
+			}
 			if err != nil {
 				return
 			}
@@ -236,7 +254,7 @@ func (s suite) testTopUp(t *testing.T) {
 	if got := r.Reserved(); got != 90 {
 		t.Fatalf("Reserved() = %d, want 90", got)
 	}
-	checkErr(t, r.TopUp(ctx, 11), limit.ErrBudgetExceeded)
+	checkExceeded(t, r.TopUp(ctx, 11), team, 11, r.Window())
 	if got := r.Reserved(); got != 90 {
 		t.Fatalf("Reserved() after failed TopUp = %d, want 90", got)
 	}

@@ -25,7 +25,7 @@ jobs:
       - uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           version: 2026.11.1
-          install_args: go golangci-lint actionlint gitleaks
+          install_args: go golangci-lint actionlint gitleaks sqlc
       - name: format
         run: mise exec -- golangci-lint fmt --diff ./...
       - name: lint
@@ -44,6 +44,22 @@ jobs:
       matrix:
         # Oldest supported release (the go.mod directive) and newest stable.
         go: ["1.26.11", "1.27.4"]
+    services:
+      postgres:
+        # postgres:18.7
+        image: postgres:18.7@sha256:2ea8630df176ad090ec92136dee850397c5af8781e4bcf2e4162593691c61bbc
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 127.0.0.1:5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    env:
+      # pgtest fails, instead of skipping, when CI=true and this is unset.
+      TW_TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/postgres?sslmode=disable
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

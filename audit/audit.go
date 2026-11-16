@@ -48,6 +48,8 @@ type Usage struct {
 
 // Event is the audit record of one request.
 type Event struct {
+	// Time is when the request started. [Slog] writes it as "event_time",
+	// apart from the "time" of the log record.
 	Time              time.Time
 	RequestID         string
 	UpstreamRequestID string
@@ -88,7 +90,7 @@ func NewSlog(log *slog.Logger) *Slog {
 // Record implements [Recorder].
 func (s *Slog) Record(ctx context.Context, ev *Event) error {
 	s.log.LogAttrs(ctx, slog.LevelInfo, "audit",
-		slog.Time("time", ev.Time),
+		slog.Time("event_time", ev.Time),
 		slog.String("request_id", ev.RequestID),
 		slog.String("upstream_request_id", ev.UpstreamRequestID),
 		slog.String("key_id", ev.KeyID),

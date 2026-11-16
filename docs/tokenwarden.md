@@ -33,6 +33,56 @@ with the upstream key and writes one audit log line per request.
           "messages":[{"role":"user","content":"Hello"}]}'
    ```
 
+## Run with Docker Compose
+
+`deploy/compose.yaml` starts two gateway replicas and the mock upstream. It
+needs Docker with Compose v2. Run the commands from the repo root.
+
+```sh
+docker compose -f deploy/compose.yaml up --build
+```
+
+| Service | Host address | Upstream |
+|---|---|---|
+| `gateway-a` | `127.0.0.1:8080` | mock |
+| `gateway-b` | `127.0.0.1:8082` | mock |
+| `gateway-a-real` | `127.0.0.1:8180` | `https://api.anthropic.com` (profile `real`) |
+| `gateway-b-real` | `127.0.0.1:8182` | `https://api.anthropic.com` (profile `real`) |
+
+`deploy/keys.json` holds two test keys: `tw_test_red_alice` (team `red`) and
+`tw_test_blue_bob` (team `blue`).
+
+The stack publishes only the proxy ports, and only on 127.0.0.1. The mock and
+the metrics listeners stay on Docker networks:
+
+- The mock is on a network with no route out of the host, because its
+  `/_faults` API has no auth.
+- The metrics carry team names.
+
+The `probe` service reads them from inside the networks:
+
+```sh
+docker compose -f deploy/compose.yaml run --rm probe -s http://gateway-a:9090/metrics
+```
+
+To use the real API:
+
+1. Copy `deploy/.env.example` to `deploy/.env`. Git ignores `deploy/.env`.
+2. Set `ANTHROPIC_API_KEY` in `deploy/.env`.
+3. Start the stack with the `real` profile:
+
+   ```sh
+   docker compose -f deploy/compose.yaml --profile real up --build
+   ```
+
+The real gateways cannot reach the mock, and the mock gateways never use the
+real API. When `ANTHROPIC_API_KEY` is empty, the real gateways do not start.
+
+`make smoke` starts the stack, sends a stream and a non-stream request
+through each mock replica, checks the audit lines, the metrics, and the
+published ports, and then stops the stack. The `smoke` workflow runs it on
+each pull request.
+
 ## Configuration
 
 The upstream settings come from the environment only. A flag would put the

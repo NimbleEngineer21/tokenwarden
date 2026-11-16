@@ -1,0 +1,87 @@
+# Two gateway replicas and the mock upstream. See docs/tokenwarden.md.
+#
+#   docker compose -f deploy/compose.yaml up --build
+#
+# Only the gateway proxy ports are published, and only on 127.0.0.1. The mock
+# (its /_faults API has no auth) and the metrics listeners (the metrics carry
+# team names) stay on Docker networks.
+#
+# --profile real adds two more gateways that use https://api.anthropic.com
+# with ANTHROPIC_API_KEY from deploy/.env. They cannot reach the mock, so the
+# mock is never a fallback for them, and the real API is never a fallback for
+# the mock gateways.
+
+name: tokenwarden
+
+x-gateway: &gateway
+  build:
+    context: ..
+    target: tokenwarden
+  image: tokenwarden:local
+  command: ["-keys", "/etc/tokenwarden/keys.json"]
+  volumes:
+    - ./keys.json:/etc/tokenwarden/keys.json:ro
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  # The gateway lets open streams run for 10 s after SIGTERM.
+  stop_grace_period: 15s
+
+services:
+  mock:
+    build:
+      context: ..
+      target: mockanthropic
+    image: tokenwarden-mockanthropic:local
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [internal]
+
+  gateway-a:
+    <<: *gateway
+    environment: &mock-upstream
+      TW_UPSTREAM_URL: http://mock:8081
+      TW_UPSTREAM_KEY: sk-ant-test-mock
+    ports: ["127.0.0.1:8080:8080"]
+    networks: [internal, edge]
+    depends_on: [mock]
+
+  gateway-b:
+    <<: *gateway
+    environment: *mock-upstream
+    ports: ["127.0.0.1:8082:8080"]
+    networks: [internal, edge]
+    depends_on: [mock]
+
+  gateway-a-real:
+    <<: *gateway
+    profiles: [real]
+    environment: &real-upstream
+      TW_UPSTREAM_URL: https://api.anthropic.com
+      # Empty when unset: the gateway then refuses to start.
+      TW_UPSTREAM_KEY: ${ANTHROPIC_API_KEY:-}
+    ports: ["127.0.0.1:8180:8080"]
+    networks: [edge]
+
+  gateway-b-real:
+    <<: *gateway
+    profiles: [real]
+    environment: *real-upstream
+    ports: ["127.0.0.1:8182:8080"]
+    networks: [edge]
+
+  # Reads /healthz and /metrics from inside the networks:
+  #   docker compose -f deploy/compose.yaml run --rm probe -s http://gateway-a:9090/metrics
+  probe:
+    # curlimages/curl:8.23.0
+    image: curlimages/curl:8.23.0@sha256:3fb7e13e5d179a845c97d78204f3f1064d1907037f26a3ebf91710571151fd93
+    profiles: [tools]
+    networks: [internal, edge]
+
+networks:
+  # No route out of the host. The mock lives only here.
+  internal:
+    internal: true
+  # Carries the published proxy ports and the real gateways' egress.
+  edge: {}

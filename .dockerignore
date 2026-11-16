@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+**/.DS_Store
+bin/
+dist/
+coverage.*
+*.prof
+*.test
+deploy/
+docs/

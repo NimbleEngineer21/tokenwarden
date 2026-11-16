@@ -43,3 +43,7 @@ secrets: ## Scan the full git history for secrets.
 
 .PHONY: check
 check: lint test build tidy vuln secrets ## Run every check that CI runs.
+
+.PHONY: smoke
+smoke: ## Start the Compose stack, test it, and stop it. Needs Docker.
+	scripts/smoke.sh

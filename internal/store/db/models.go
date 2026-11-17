@@ -9,9 +9,11 @@ import (
 )
 
 type Budget struct {
-	Team     string
-	Tokens   int64
-	WindowUs int64
+	Team        string
+	Tokens      int64
+	WindowUs    int64
+	MaxInflight int64
+	Inflight    int64
 }
 
 type Reservation struct {

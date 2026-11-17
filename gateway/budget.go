@@ -23,6 +23,7 @@ const topUpChunk = 512
 const (
 	errMsgExceeded    = "the team's token budget for this window is used up"
 	errMsgNoBudget    = "the team has no token budget"
+	errMsgConcurrency = "the team has too many requests in flight"
 	errMsgUnavailable = "the token budget service is unavailable"
 )
 
@@ -69,6 +70,11 @@ func (g *gateway) reserve(ctx context.Context, w http.ResponseWriter, ev *audit.
 			w.Header().Set("Retry-After", strconv.FormatFloat(max(secs, 1), 'f', 0, 64))
 		}
 		fail(w, ev, audit.OutcomeBudgetExceeded, http.StatusTooManyRequests, anthropic.ErrRateLimit, errMsgExceeded)
+	case errors.Is(err, limit.ErrConcurrencyExceeded):
+		// No Retry-After: nothing tells when a slot frees up, and clients
+		// back off on a 429 without one.
+		g.metrics.denials.WithLabelValues(ev.Team, "concurrency").Inc()
+		fail(w, ev, audit.OutcomeBudgetExceeded, http.StatusTooManyRequests, anthropic.ErrRateLimit, errMsgConcurrency)
 	case errors.Is(err, limit.ErrNoBudget):
 		g.metrics.denials.WithLabelValues(ev.Team, "reserve").Inc()
 		fail(w, ev, audit.OutcomeBudgetExceeded, http.StatusForbidden, anthropic.ErrPermission, errMsgNoBudget)

@@ -1,11 +1,12 @@
 -- name: UpsertBudget :exec
-INSERT INTO budgets (team, tokens, window_us)
-VALUES (@team, @tokens, @window_us)
+INSERT INTO budgets (team, tokens, window_us, max_inflight)
+VALUES (@team, @tokens, @window_us, @max_inflight)
 ON CONFLICT (team) DO UPDATE
-SET tokens = EXCLUDED.tokens, window_us = EXCLUDED.window_us;
+SET tokens = EXCLUDED.tokens, window_us = EXCLUDED.window_us,
+    max_inflight = EXCLUDED.max_inflight;
 
 -- name: GetBudget :one
-SELECT tokens, window_us FROM budgets WHERE team = @team;
+SELECT tokens, window_us, max_inflight FROM budgets WHERE team = @team;
 
 -- name: EnsureWindow :exec
 INSERT INTO usage_windows (team, window_start, window_us)
@@ -59,24 +60,34 @@ SELECT
     EXISTS (SELECT 1 FROM r) AS open,
     EXISTS (SELECT 1 FROM h) AS granted;
 
--- Settle deletes a reservation, frees what it held, and charges used
--- tokens to its window. It returns no row when the reservation has already
--- settled. settled saturates at the bigint maximum instead of raising an
--- overflow error.
+-- Settle deletes a reservation, frees what it held, charges used tokens to
+-- its window, and frees its in-flight slot. It returns no row when the
+-- reservation has already settled. settled saturates at the bigint maximum
+-- instead of raising an overflow error. The budget update reads the window
+-- update's rows, so it runs after it: rows lock in the order reservation,
+-- window, budget, as in Reserve and the reaper.
 -- name: Settle :one
 WITH r AS (
     DELETE FROM reservations res
     WHERE res.id = @id
     RETURNING res.team, res.window_start, res.window_us, res.held
+), w AS (
+    UPDATE usage_windows u
+    SET reserved = u.reserved - r.held,
+        settled = LEAST(u.settled, 9223372036854775807 - @used::bigint) + @used::bigint
+    FROM r
+    WHERE u.team = r.team
+      AND u.window_start = r.window_start
+      AND u.window_us = r.window_us
+    RETURNING u.team, u.settled
+), b AS (
+    UPDATE budgets bu
+    SET inflight = GREATEST(bu.inflight - 1, 0)
+    FROM w
+    WHERE bu.team = w.team
+    RETURNING bu.team
 )
-UPDATE usage_windows u
-SET reserved = u.reserved - r.held,
-    settled = LEAST(u.settled, 9223372036854775807 - @used::bigint) + @used::bigint
-FROM r
-WHERE u.team = r.team
-  AND u.window_start = r.window_start
-  AND u.window_us = r.window_us
-RETURNING u.settled;
+SELECT w.settled FROM w;
 
 -- RenewLeases extends the leases of open reservations. It never shortens a
 -- lease, so a replica whose clock is behind cannot end one early.
@@ -109,6 +120,21 @@ SET reserved = u.reserved - @held::bigint,
 WHERE u.team = @team
   AND u.window_start = @window_start
   AND u.window_us = @window_us;
+
+-- TakeSlot takes one in-flight slot of the team. It updates no row when
+-- the team is at its limit. Reserve runs it after the window update, in the
+-- same transaction.
+-- name: TakeSlot :execrows
+UPDATE budgets b
+SET inflight = b.inflight + 1
+WHERE b.team = @team
+  AND (b.max_inflight = 0 OR b.inflight < b.max_inflight);
+
+-- ReleaseSlots frees in-flight slots of reaped reservations.
+-- name: ReleaseSlots :exec
+UPDATE budgets b
+SET inflight = GREATEST(b.inflight - sqlc.arg(n)::bigint, 0)
+WHERE b.team = @team;
 
 -- PruneWindows deletes the windows that ended at or before the given time
 -- and that no reservation holds.

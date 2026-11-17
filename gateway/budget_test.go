@@ -183,6 +183,41 @@ func TestBudgetRefusals(t *testing.T) {
 	}
 }
 
+func TestBudgetConcurrency(t *testing.T) {
+	ml, err := memory.New(map[string]limit.Budget{"red": {Tokens: 1000, Window: budgetWindow, MaxInflight: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := ml.Reserve(t.Context(), "red", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := newStack(t, upstreamKey, func(c *Config) { c.Limiter = ml })
+	resp := do(t, s.gateway.URL+"/v1/messages", streamBody, keyHeader())
+	if resp.StatusCode != http.StatusTooManyRequests || errorBody(t, resp).Error.Type != anthropic.ErrRateLimit {
+		t.Fatalf("status %d body %s; want 429 rate_limit_error", resp.StatusCode, resp.Body)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra != "" {
+		t.Errorf("Retry-After = %q, want none", ra)
+	}
+	if ev := s.event(t); ev.Outcome != audit.OutcomeBudgetExceeded {
+		t.Fatalf("outcome = %q", ev.Outcome)
+	}
+	if n := len(s.spy.requests()); n != 0 {
+		t.Fatalf("%d requests went upstream, want none", n)
+	}
+	if got := metricValue(t, s.reg, "tokenwarden_budget_denials_total", map[string]string{"team": "red", "stage": "concurrency"}); got != 1 {
+		t.Fatalf("budget_denials_total{concurrency} = %v, want 1", got)
+	}
+
+	if err := held.Settle(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	if resp := do(t, s.gateway.URL+"/v1/messages", textBody, keyHeader()); resp.StatusCode != http.StatusOK {
+		t.Fatalf("after the slot freed: status %d body %s", resp.StatusCode, resp.Body)
+	}
+}
+
 func TestBudgetNoBudget(t *testing.T) {
 	ml, err := memory.New(map[string]limit.Budget{"blue": {Tokens: 1000, Window: budgetWindow}})
 	if err != nil {

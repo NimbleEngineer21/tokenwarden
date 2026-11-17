@@ -109,18 +109,19 @@ func (q *Queries) EnsureWindow(ctx context.Context, arg EnsureWindowParams) erro
 }
 
 const getBudget = `-- name: GetBudget :one
-SELECT tokens, window_us FROM budgets WHERE team = $1
+SELECT tokens, window_us, max_inflight FROM budgets WHERE team = $1
 `
 
 type GetBudgetRow struct {
-	Tokens   int64
-	WindowUs int64
+	Tokens      int64
+	WindowUs    int64
+	MaxInflight int64
 }
 
 func (q *Queries) GetBudget(ctx context.Context, team string) (GetBudgetRow, error) {
 	row := q.db.QueryRow(ctx, getBudget, team)
 	var i GetBudgetRow
-	err := row.Scan(&i.Tokens, &i.WindowUs)
+	err := row.Scan(&i.Tokens, &i.WindowUs, &i.MaxInflight)
 	return i, err
 }
 
@@ -143,6 +144,23 @@ func (q *Queries) PruneWindows(ctx context.Context, endedBy time.Time) (int64, e
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const releaseSlots = `-- name: ReleaseSlots :exec
+UPDATE budgets b
+SET inflight = GREATEST(b.inflight - $1::bigint, 0)
+WHERE b.team = $2
+`
+
+type ReleaseSlotsParams struct {
+	N    int64
+	Team string
+}
+
+// ReleaseSlots frees in-flight slots of reaped reservations.
+func (q *Queries) ReleaseSlots(ctx context.Context, arg ReleaseSlotsParams) error {
+	_, err := q.db.Exec(ctx, releaseSlots, arg.N, arg.Team)
+	return err
 }
 
 const renewLeases = `-- name: RenewLeases :exec
@@ -207,33 +225,61 @@ func (q *Queries) Reserve(ctx context.Context, arg ReserveParams) (int64, error)
 const settle = `-- name: Settle :one
 WITH r AS (
     DELETE FROM reservations res
-    WHERE res.id = $2
+    WHERE res.id = $1
     RETURNING res.team, res.window_start, res.window_us, res.held
+), w AS (
+    UPDATE usage_windows u
+    SET reserved = u.reserved - r.held,
+        settled = LEAST(u.settled, 9223372036854775807 - $2::bigint) + $2::bigint
+    FROM r
+    WHERE u.team = r.team
+      AND u.window_start = r.window_start
+      AND u.window_us = r.window_us
+    RETURNING u.team, u.settled
+), b AS (
+    UPDATE budgets bu
+    SET inflight = GREATEST(bu.inflight - 1, 0)
+    FROM w
+    WHERE bu.team = w.team
+    RETURNING bu.team
 )
-UPDATE usage_windows u
-SET reserved = u.reserved - r.held,
-    settled = LEAST(u.settled, 9223372036854775807 - $1::bigint) + $1::bigint
-FROM r
-WHERE u.team = r.team
-  AND u.window_start = r.window_start
-  AND u.window_us = r.window_us
-RETURNING u.settled
+SELECT w.settled FROM w
 `
 
 type SettleParams struct {
-	Used int64
 	ID   int64
+	Used int64
 }
 
-// Settle deletes a reservation, frees what it held, and charges used
-// tokens to its window. It returns no row when the reservation has already
-// settled. settled saturates at the bigint maximum instead of raising an
-// overflow error.
+// Settle deletes a reservation, frees what it held, charges used tokens to
+// its window, and frees its in-flight slot. It returns no row when the
+// reservation has already settled. settled saturates at the bigint maximum
+// instead of raising an overflow error. The budget update reads the window
+// update's rows, so it runs after it: rows lock in the order reservation,
+// window, budget, as in Reserve and the reaper.
 func (q *Queries) Settle(ctx context.Context, arg SettleParams) (int64, error) {
-	row := q.db.QueryRow(ctx, settle, arg.Used, arg.ID)
+	row := q.db.QueryRow(ctx, settle, arg.ID, arg.Used)
 	var settled int64
 	err := row.Scan(&settled)
 	return settled, err
+}
+
+const takeSlot = `-- name: TakeSlot :execrows
+UPDATE budgets b
+SET inflight = b.inflight + 1
+WHERE b.team = $1
+  AND (b.max_inflight = 0 OR b.inflight < b.max_inflight)
+`
+
+// TakeSlot takes one in-flight slot of the team. It updates no row when
+// the team is at its limit. Reserve runs it after the window update, in the
+// same transaction.
+func (q *Queries) TakeSlot(ctx context.Context, team string) (int64, error) {
+	result, err := q.db.Exec(ctx, takeSlot, team)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const topUp = `-- name: TopUp :one
@@ -286,19 +332,26 @@ func (q *Queries) TopUp(ctx context.Context, arg TopUpParams) (TopUpRow, error) 
 }
 
 const upsertBudget = `-- name: UpsertBudget :exec
-INSERT INTO budgets (team, tokens, window_us)
-VALUES ($1, $2, $3)
+INSERT INTO budgets (team, tokens, window_us, max_inflight)
+VALUES ($1, $2, $3, $4)
 ON CONFLICT (team) DO UPDATE
-SET tokens = EXCLUDED.tokens, window_us = EXCLUDED.window_us
+SET tokens = EXCLUDED.tokens, window_us = EXCLUDED.window_us,
+    max_inflight = EXCLUDED.max_inflight
 `
 
 type UpsertBudgetParams struct {
-	Team     string
-	Tokens   int64
-	WindowUs int64
+	Team        string
+	Tokens      int64
+	WindowUs    int64
+	MaxInflight int64
 }
 
 func (q *Queries) UpsertBudget(ctx context.Context, arg UpsertBudgetParams) error {
-	_, err := q.db.Exec(ctx, upsertBudget, arg.Team, arg.Tokens, arg.WindowUs)
+	_, err := q.db.Exec(ctx, upsertBudget,
+		arg.Team,
+		arg.Tokens,
+		arg.WindowUs,
+		arg.MaxInflight,
+	)
 	return err
 }

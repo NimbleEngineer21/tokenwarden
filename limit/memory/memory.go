@@ -23,6 +23,8 @@ type Limiter struct {
 	mu sync.Mutex
 	// windows maps team, then window start, to that window's counter.
 	windows map[string]map[time.Time]*counter
+	// inflight counts each team's open reservations.
+	inflight map[string]int64
 }
 
 type counter struct {
@@ -52,9 +54,10 @@ func WithClock(now func() time.Time) Option {
 // positive.
 func New(budgets map[string]limit.Budget, opts ...Option) (*Limiter, error) {
 	l := &Limiter{
-		budgets: make(map[string]limit.Budget, len(budgets)),
-		now:     time.Now,
-		windows: make(map[string]map[time.Time]*counter, len(budgets)),
+		budgets:  make(map[string]limit.Budget, len(budgets)),
+		now:      time.Now,
+		windows:  make(map[string]map[time.Time]*counter, len(budgets)),
+		inflight: make(map[string]int64, len(budgets)),
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -67,6 +70,8 @@ func New(budgets map[string]limit.Budget, opts ...Option) (*Limiter, error) {
 			return nil, fmt.Errorf("memory: team %q: tokens must be positive", team)
 		case b.Window <= 0:
 			return nil, fmt.Errorf("memory: team %q: window must be positive", team)
+		case b.MaxInflight < 0:
+			return nil, fmt.Errorf("memory: team %q: max in-flight must not be negative", team)
 		}
 		l.budgets[team] = b
 	}
@@ -104,6 +109,10 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	if !fits(c, tokens, b.Tokens) {
 		return nil, fmt.Errorf("memory: reserve: %w", &limit.ExceededError{Team: team, Tokens: tokens, Window: w})
 	}
+	if b.MaxInflight > 0 && l.inflight[team] >= b.MaxInflight {
+		return nil, fmt.Errorf("memory: reserve: %w", &limit.ConcurrencyError{Team: team, Limit: b.MaxInflight})
+	}
+	l.inflight[team]++
 	c.reserved += tokens
 	c.open++
 	return &reservation{l: l, team: team, budget: b.Tokens, window: w, c: c, held: tokens}, nil
@@ -187,6 +196,7 @@ func (r *reservation) Settle(_ context.Context, used int64) error {
 	// and reopen the window.
 	r.c.settled = min(r.c.settled, math.MaxInt64-used) + used
 	r.c.open--
+	r.l.inflight[r.team]--
 	r.held = 0
 	return nil
 }

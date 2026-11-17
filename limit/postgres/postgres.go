@@ -1,9 +1,11 @@
 // Package postgres is a [limit.Limiter] that keeps budgets and usage in
 // Postgres, so that gateway replicas share them.
 //
-// Each Reserve, TopUp, and Settle is one conditional statement on the
-// team's row for the window, so concurrent replicas can never hold more
-// than the budget. The window of a new reservation comes from the Go clock
+// Each TopUp and Settle is one conditional statement on the team's row for
+// the window, and each Reserve is one transaction of two conditional
+// statements, on that row and on the team's budget row. So concurrent
+// replicas can never hold more than the budget or pass the in-flight
+// limit. The window of a new reservation comes from the Go clock
 // of the replica, not from the database clock; replica clocks must agree to
 // well within a window length.
 //
@@ -136,8 +138,9 @@ func New(pool *pgxpool.Pool, opts ...Option) *Limiter {
 // SetBudget creates or replaces the budget of team. Open reservations keep
 // the budget that they started with; new reservations use the new one. A
 // new window length starts a new count at once. It returns an error for an
-// empty team, tokens that are not positive, or a window that is not a
-// positive whole number of microseconds.
+// empty team, tokens that are not positive, a window that is not a
+// positive whole number of microseconds, or a negative MaxInflight. A
+// MaxInflight below the team's open reservations blocks only new ones.
 func (l *Limiter) SetBudget(ctx context.Context, team string, b limit.Budget) error {
 	switch {
 	case team == "":
@@ -146,11 +149,14 @@ func (l *Limiter) SetBudget(ctx context.Context, team string, b limit.Budget) er
 		return fmt.Errorf("postgres: team %q: tokens must be positive", team)
 	case b.Window <= 0 || b.Window%time.Microsecond != 0:
 		return fmt.Errorf("postgres: team %q: window must be a positive whole number of microseconds", team)
+	case b.MaxInflight < 0:
+		return fmt.Errorf("postgres: team %q: max in-flight must not be negative", team)
 	}
 	err := l.q.UpsertBudget(ctx, db.UpsertBudgetParams{
-		Team:     team,
-		Tokens:   b.Tokens,
-		WindowUs: b.Window.Microseconds(),
+		Team:        team,
+		Tokens:      b.Tokens,
+		WindowUs:    b.Window.Microseconds(),
+		MaxInflight: b.MaxInflight,
 	})
 	if err != nil {
 		return fmt.Errorf("postgres: team %q: set budget: %w", team, err)
@@ -180,16 +186,34 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	if err != nil {
 		return nil, fmt.Errorf("postgres: team %q: create window: %w", team, err)
 	}
-	id, err := l.q.Reserve(ctx, db.ReserveParams{
-		Budget:      b.Tokens,
-		Tokens:      tokens,
-		ExpiresAt:   now.Add(l.ttl),
-		Team:        team,
-		WindowStart: w.Start,
-		WindowUs:    b.WindowUs,
+	var id int64
+	err = pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
+		q := l.q.WithTx(tx)
+		var err error
+		id, err = q.Reserve(ctx, db.ReserveParams{
+			Budget:      b.Tokens,
+			Tokens:      tokens,
+			ExpiresAt:   now.Add(l.ttl),
+			Team:        team,
+			WindowStart: w.Start,
+			WindowUs:    b.WindowUs,
+		})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return &limit.ExceededError{Team: team, Tokens: tokens, Window: w}
+		}
+		if err != nil {
+			return err
+		}
+		// After the window update, so that rows lock in the same order
+		// as in Settle.
+		n, err := q.TakeSlot(ctx, team)
+		if err == nil && n == 0 {
+			return &limit.ConcurrencyError{Team: team, Limit: b.MaxInflight}
+		}
+		return err
 	})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, fmt.Errorf("postgres: reserve: %w", &limit.ExceededError{Team: team, Tokens: tokens, Window: w})
+	if errors.Is(err, limit.ErrBudgetExceeded) || errors.Is(err, limit.ErrConcurrencyExceeded) {
+		return nil, fmt.Errorf("postgres: reserve: %w", err)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("postgres: team %q: reserve %d tokens: %w", team, tokens, err)

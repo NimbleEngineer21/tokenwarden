@@ -30,6 +30,7 @@ func TestNewRejectsBadBudgets(t *testing.T) {
 		{"negative tokens", map[string]limit.Budget{"team-a": {Tokens: -1, Window: time.Minute}}},
 		{"zero window", map[string]limit.Budget{"team-a": {Tokens: 1, Window: 0}}},
 		{"negative window", map[string]limit.Budget{"team-a": {Tokens: 1, Window: -time.Minute}}},
+		{"negative max in-flight", map[string]limit.Budget{"team-a": {Tokens: 1, Window: time.Minute, MaxInflight: -1}}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -2,6 +2,7 @@ package postgres_test
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -114,6 +115,7 @@ func TestSetBudgetRejectsBadInput(t *testing.T) {
 		{"zero window", "team-a", limit.Budget{Tokens: 1, Window: 0}},
 		{"negative window", "team-a", limit.Budget{Tokens: 1, Window: -time.Minute}},
 		{"sub-microsecond window", "team-a", limit.Budget{Tokens: 1, Window: time.Minute + time.Nanosecond}},
+		{"negative max in-flight", "team-a", limit.Budget{Tokens: 1, Window: time.Minute, MaxInflight: -1}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -121,5 +123,62 @@ func TestSetBudgetRejectsBadInput(t *testing.T) {
 				t.Error("SetBudget returned no error")
 			}
 		})
+	}
+}
+
+// TestReplicasShareInflightCap checks that the in-flight limit holds when
+// two replicas reserve at the same time, and that settles free every slot.
+func TestReplicasShareInflightCap(t *testing.T) {
+	const workers, maxInflight = 40, 7
+	pool := newPool(t)
+	other, err := pgxpool.NewWithConfig(t.Context(), pool.Config())
+	if err != nil {
+		t.Fatalf("second pool: %v", err)
+	}
+	t.Cleanup(other.Close)
+	now := func() time.Time { return time.Date(2001, 2, 3, 4, 5, 15, 0, time.UTC) }
+	replicas := []*postgres.Limiter{
+		postgres.New(pool, postgres.WithClock(now)),
+		postgres.New(other, postgres.WithClock(now)),
+	}
+	setBudgets(t, replicas[0], map[string]limit.Budget{"team-a": {Tokens: 1_000_000, Window: time.Minute, MaxInflight: maxInflight}})
+	ctx := t.Context()
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		granted []limit.Reservation
+	)
+	for i := range workers {
+		wg.Go(func() {
+			r, err := replicas[i%2].Reserve(ctx, "team-a", 10)
+			switch {
+			case err == nil:
+				mu.Lock()
+				granted = append(granted, r)
+				mu.Unlock()
+			case !errors.Is(err, limit.ErrConcurrencyExceeded):
+				t.Errorf("Reserve: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	if len(granted) != maxInflight {
+		t.Fatalf("%d reservations granted, want %d", len(granted), maxInflight)
+	}
+	for _, r := range granted {
+		if err := r.Settle(ctx, 10); err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+	}
+	var inflight, reserved int64
+	if err := pool.QueryRow(ctx, "SELECT inflight FROM budgets WHERE team = 'team-a'").Scan(&inflight); err != nil {
+		t.Fatalf("read inflight: %v", err)
+	}
+	if err := pool.QueryRow(ctx, "SELECT reserved FROM usage_windows WHERE team = 'team-a'").Scan(&reserved); err != nil {
+		t.Fatalf("read reserved: %v", err)
+	}
+	if inflight != 0 || reserved != 0 {
+		t.Errorf("after the settles: inflight = %d, reserved = %d; want 0, 0 (a denied Reserve left a hold)", inflight, reserved)
 	}
 }

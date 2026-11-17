@@ -109,8 +109,48 @@ for r in $replicas; do
 	echo "smoke: $svc passed"
 done
 
-# Team blue has 600 tokens per minute (deploy/budgets.sql).
+# Team blue has 600 tokens per minute and at most 2 requests in flight
+# (deploy/budgets.sql).
 blue=tw_test_blue_bob
+
+# Two requests that the mock holds for 20 s take both slots; a third gets
+# 429 with no Retry-After. Cutting the held ones before the upstream
+# answers costs no tokens.
+probe -f -X POST http://mock:8081/_faults -H 'x-api-key: sk-ant-test-mock' \
+	-H 'content-type: application/json' -d '{"delay":"20s","count":2}' >/dev/null ||
+	fail "could not set the delay fault"
+request 8080 "$blue" false 32 -o /dev/null 2>/dev/null &
+held1=$!
+request 8082 "$blue" false 32 -o /dev/null 2>/dev/null &
+held2=$!
+n=0
+while :; do
+	sleep 1
+	headers=$(request 8080 "$blue" false 32 -o /dev/null -D -) ||
+		fail "the third in-flight request failed"
+	echo "$headers" | grep -q '^HTTP/[0-9.]* 429' && break
+	n=$((n + 1))
+	[ "$n" -lt 10 ] || fail "a third request in flight did not get 429:
+$headers"
+done
+# Each held request is a subshell; killing only the subshell leaves its
+# curl running, and that curl then gets the reply and spends tokens.
+pkill -P "$held1" 2>/dev/null || true
+pkill -P "$held2" 2>/dev/null || true
+kill "$held1" "$held2" 2>/dev/null || true
+wait "$held1" "$held2" 2>/dev/null || true
+probe -f -X DELETE http://mock:8081/_faults -H 'x-api-key: sk-ant-test-mock' >/dev/null ||
+	fail "could not clear the faults"
+if echo "$headers" | grep -qi '^retry-after:'; then
+	fail "the in-flight 429 has a Retry-After:
+$headers"
+fi
+# The metric, not the audit line, tells this 429 apart from the
+# over-budget ones below.
+probe "http://gateway-a:9090/metrics" |
+	grep -q '^tokenwarden_budget_denials_total{stage="concurrency",team="blue"} [1-9]' ||
+	fail "gateway-a counted no in-flight denial for blue"
+echo "smoke: a third request in flight gets 429"
 
 # The first hold, input plus max_tokens, does not fit: 429 with Retry-After.
 headers=$(request 8080 "$blue" false 1000 -o /dev/null -D -) ||

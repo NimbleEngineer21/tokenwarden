@@ -44,7 +44,7 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 		}, []string{"result"}),
 		denials: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "tokenwarden_budget_denials_total",
-			Help: "Requests that the token budget stopped, by team and stage: reserve or topup.",
+			Help: "Requests that the token budget stopped, by team and stage: reserve, concurrency, or topup.",
 		}, []string{"team", "stage"}),
 	}
 	if reg == nil {

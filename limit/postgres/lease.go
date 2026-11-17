@@ -108,10 +108,12 @@ type windowKey struct {
 	us      int64
 }
 
-// reapBatch deletes up to reapBatch expired reservations and charges what
-// they held to their windows, in one transaction. It updates the windows in
-// key order, so that two replicas that reap at the same time cannot
-// deadlock on them.
+// reapBatch deletes up to reapBatch expired reservations, charges what they
+// held to their windows, and frees their in-flight slots, in one
+// transaction. It updates the windows in key order and then the budgets in
+// team order, so that two replicas that reap at the same time cannot
+// deadlock, and a Settle or Reserve, which lock a window before a budget,
+// cannot deadlock with it.
 func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error) {
 	err = pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
 		q := l.q.WithTx(tx)
@@ -120,7 +122,9 @@ func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error
 			return err
 		}
 		held := make(map[windowKey]int64)
+		slots := make(map[string]int64)
 		for _, r := range rows {
+			slots[r.Team]++
 			k := windowKey{r.Team, r.WindowStart.UnixMicro(), r.WindowUs}
 			// The sum fits: it is at most the window's reserved count.
 			held[k] += r.Held
@@ -140,6 +144,11 @@ func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error
 				return err
 			}
 			tokens = min(tokens, math.MaxInt64-held[k]) + held[k]
+		}
+		for _, team := range slices.Sorted(maps.Keys(slots)) {
+			if err := q.ReleaseSlots(ctx, db.ReleaseSlotsParams{N: slots[team], Team: team}); err != nil {
+				return err
+			}
 		}
 		n = len(rows)
 		return nil

@@ -43,6 +43,26 @@ func (e *ExceededError) Error() string {
 // Unwrap returns [ErrBudgetExceeded].
 func (e *ExceededError) Unwrap() error { return ErrBudgetExceeded }
 
+// ErrConcurrencyExceeded means that the team already has as many open
+// reservations as its budget allows.
+var ErrConcurrencyExceeded = errors.New("limit: too many requests in flight")
+
+// ConcurrencyError is the error that a [Limiter] returns when the team is
+// at its in-flight limit. It wraps [ErrConcurrencyExceeded].
+type ConcurrencyError struct {
+	Team string
+	// Limit is the team's [Budget.MaxInflight].
+	Limit int64
+}
+
+// Error implements the error interface.
+func (e *ConcurrencyError) Error() string {
+	return fmt.Sprintf("team %q: %d requests in flight: %v", e.Team, e.Limit, ErrConcurrencyExceeded)
+}
+
+// Unwrap returns [ErrConcurrencyExceeded].
+func (e *ConcurrencyError) Unwrap() error { return ErrConcurrencyExceeded }
+
 // ErrNoBudget means that the team has no budget. A [Limiter] fails closed
 // for such a team: it reserves nothing.
 var ErrNoBudget = errors.New("limit: no budget for team")
@@ -57,6 +77,9 @@ type Budget struct {
 	Tokens int64
 	// Window is the length of one window. It must be positive.
 	Window time.Duration
+	// MaxInflight is the most open reservations that the team can have at
+	// once, in all windows. Zero means no limit; it must not be negative.
+	MaxInflight int64
 }
 
 // Window is one fixed budget window.
@@ -91,8 +114,10 @@ func (w Window) End() time.Time {
 type Limiter interface {
 	// Reserve holds tokens in the team's current window. It returns an
 	// error that wraps an [*ExceededError] when settled plus reserved plus
-	// tokens would pass the budget, and one that wraps [ErrNoBudget] when
-	// the team has no budget. tokens must be positive.
+	// tokens would pass the budget, one that wraps a [*ConcurrencyError]
+	// when the team is at its in-flight limit, and one that wraps
+	// [ErrNoBudget] when the team has no budget. tokens must be positive.
+	// The reservation takes one in-flight slot until it settles.
 	Reserve(ctx context.Context, team string, tokens int64) (Reservation, error)
 }
 

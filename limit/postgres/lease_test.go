@@ -121,6 +121,13 @@ func TestReapChargesExpiredHold(t *testing.T) {
 	if s, rv := usage(t, pool); s != 40 || rv != 0 {
 		t.Fatalf("settled, reserved = %d, %d; want 40, 0", s, rv)
 	}
+	var inflight int64
+	if err := pool.QueryRow(ctx, "SELECT inflight FROM budgets WHERE team = 'team-a'").Scan(&inflight); err != nil {
+		t.Fatalf("read inflight: %v", err)
+	}
+	if inflight != 0 {
+		t.Errorf("inflight = %d after the reap, want 0", inflight)
+	}
 	if err := res.TopUp(ctx, 1); !errors.Is(err, limit.ErrReservationClosed) {
 		t.Errorf("TopUp after reap: err = %v, want ErrReservationClosed", err)
 	}

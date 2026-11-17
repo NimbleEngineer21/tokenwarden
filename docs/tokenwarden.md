@@ -191,17 +191,20 @@ replicas that use one database share the budgets.
 At start, the gateway creates or updates the schema in `TW_DATABASE_URL`.
 Replicas that start at the same time wait for each other. The gateway does
 not set budgets. Set them with SQL. `window_us` is the window length in
-microseconds:
+microseconds. `max_inflight` is the most requests of the team that can be
+in flight at once, on all replicas together; 0 means no limit:
 
 ```sql
-INSERT INTO budgets (team, tokens, window_us)
-VALUES ('red', 1000000, 3600000000)
+INSERT INTO budgets (team, tokens, window_us, max_inflight)
+VALUES ('red', 1000000, 3600000000, 20)
 ON CONFLICT (team) DO UPDATE
-SET tokens = EXCLUDED.tokens, window_us = EXCLUDED.window_us;
+SET tokens = EXCLUDED.tokens, window_us = EXCLUDED.window_us,
+    max_inflight = EXCLUDED.max_inflight;
 ```
 
 A new budget applies to the next requests. Open requests keep the budget
-that they started with.
+that they started with. A lower `max_inflight` does not stop open
+requests; it refuses new ones until enough of them end.
 
 The gateway holds tokens before it sends a request upstream, and corrects
 the hold when the reply ends:
@@ -216,6 +219,7 @@ replies:
 | Case | Reply |
 |---|---|
 | The first hold does not fit in the budget. | 429 `rate_limit_error` with `Retry-After`: the seconds to the end of the window. |
+| The team has `max_inflight` requests in flight. | 429 `rate_limit_error`, with no `Retry-After`. |
 | The team has no budget. | 403 `permission_error`. |
 | A stream needs a hold that does not fit. | The stream ends with a `rate_limit_error` event in place of the next delta. |
 | The database fails. | 503 `api_error`, or an `api_error` event in a stream. The gateway fails closed. |
@@ -258,7 +262,7 @@ interface.
 | `tokenwarden_request_duration_seconds` | histogram | `stream` | Time from the request to the end of the reply. |
 | `tokenwarden_streams_active` | gauge | none | Streams that the gateway relays now. |
 | `tokenwarden_tokens_total` | counter | `team`, `kind` | Tokens that the upstream reported. `kind` is one of `input`, `output`, `cache_creation`, `cache_read`. |
-| `tokenwarden_budget_denials_total` | counter | `team`, `stage` | Requests that the token budget stopped. `stage` is `reserve` (429 or 403 before the upstream call) or `topup` (a stream cut). |
+| `tokenwarden_budget_denials_total` | counter | `team`, `stage` | Requests that the token budget stopped. `stage` is `reserve` (429 or 403 before the upstream call), `concurrency` (429 at the in-flight limit), or `topup` (a stream cut). |
 | `tokenwarden_topups_total` | counter | `result` | Stream holds after the first one. `result` is one of `ok`, `exceeded`, `error`. |
 | `tokenwarden_reaped_reservations_total` | counter | none | Holds that the gateway reaped after their lease ended. Only with budgets on. |
 | `tokenwarden_reaped_tokens_total` | counter | none | Tokens that the reaped holds held. They count as used. Only with budgets on. |

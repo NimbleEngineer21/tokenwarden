@@ -57,6 +57,10 @@ func Run(t *testing.T, newLimiter Factory) {
 	t.Run("RolloverSettlesInStartWindow", s.testRolloverSettlesInStartWindow)
 	t.Run("ConcurrentReserveNeverPassesBudget", s.testConcurrentReserveNeverPassesBudget)
 	t.Run("ConcurrentTopUpOverspendBound", s.testConcurrentTopUpOverspendBound)
+	t.Run("InflightCap", s.testInflightCap)
+	t.Run("InflightCapSpansWindows", s.testInflightCapSpansWindows)
+	t.Run("NoInflightCapAtZero", s.testNoInflightCapAtZero)
+	t.Run("ConcurrentReserveNeverPassesInflightCap", s.testConcurrentReserveNeverPassesInflightCap)
 }
 
 type suite struct {
@@ -454,4 +458,115 @@ func (s suite) testConcurrentTopUpOverspendBound(t *testing.T) {
 		t.Errorf("settled %d tokens, bound is %d", used, budget+overage)
 	}
 	assertRemaining(t, l, max(0, budget-used))
+}
+
+// newCapLimiter returns a limiter where team has 1000 tokens per window
+// and at most maxInflight open reservations, and the clock that it reads.
+func (s suite) newCapLimiter(t *testing.T, maxInflight int64) (limit.Limiter, *clock) {
+	t.Helper()
+	c := &clock{t: start}
+	return s.newLimiter(t, map[string]limit.Budget{
+		team:     {Tokens: 1000, Window: window, MaxInflight: maxInflight},
+		"team-b": {Tokens: 1000, Window: window, MaxInflight: 1},
+	}, c.now), c
+}
+
+func assertConcurrencyError(t *testing.T, err error, wantLimit int64) {
+	t.Helper()
+	var ce *limit.ConcurrencyError
+	if !errors.As(err, &ce) || !errors.Is(err, limit.ErrConcurrencyExceeded) {
+		t.Fatalf("err = %v, want a *ConcurrencyError that wraps ErrConcurrencyExceeded", err)
+	}
+	if ce.Team != team || ce.Limit != wantLimit {
+		t.Errorf("ConcurrencyError = %+v, want team %q, limit %d", ce, team, wantLimit)
+	}
+	if errors.Is(err, limit.ErrBudgetExceeded) {
+		t.Errorf("err = %v also wraps ErrBudgetExceeded", err)
+	}
+}
+
+func (s suite) testInflightCap(t *testing.T) {
+	l, _ := s.newCapLimiter(t, 2)
+	ctx := t.Context()
+
+	if _, err := l.Reserve(ctx, "team-b", 10); err != nil {
+		t.Fatalf("team-b: Reserve: %v", err)
+	}
+	r1 := mustReserve(t, l, 10)
+	r2 := mustReserve(t, l, 10)
+	_, err := l.Reserve(ctx, team, 10)
+	assertConcurrencyError(t, err, 2)
+	if err := r2.TopUp(ctx, 5); err != nil {
+		t.Fatalf("TopUp at the in-flight limit: %v", err)
+	}
+
+	if err := r1.Settle(ctx, 10); err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	r3 := mustReserve(t, l, 10)
+	for _, r := range []limit.Reservation{r2, r3} {
+		if err := r.Settle(ctx, 10); err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+	}
+	// The denied Reserve held nothing.
+	assertRemaining(t, l, 970)
+}
+
+// testInflightCapSpansWindows checks that a reservation that started in an
+// earlier window still takes a slot.
+func (s suite) testInflightCapSpansWindows(t *testing.T) {
+	l, c := s.newCapLimiter(t, 1)
+	r := mustReserve(t, l, 10)
+	c.advance(window)
+	_, err := l.Reserve(t.Context(), team, 10)
+	assertConcurrencyError(t, err, 1)
+	if err := r.Settle(t.Context(), 10); err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	mustReserve(t, l, 10)
+}
+
+func (s suite) testNoInflightCapAtZero(t *testing.T) {
+	l, _ := s.newCapLimiter(t, 0)
+	for range 50 {
+		mustReserve(t, l, 1)
+	}
+}
+
+func (s suite) testConcurrentReserveNeverPassesInflightCap(t *testing.T) {
+	const workers, maxInflight = 20, 5
+	l, _ := s.newCapLimiter(t, maxInflight)
+	ctx := t.Context()
+
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		granted []limit.Reservation
+	)
+	for range workers {
+		wg.Go(func() {
+			r, err := l.Reserve(ctx, team, 1)
+			switch {
+			case err == nil:
+				mu.Lock()
+				granted = append(granted, r)
+				mu.Unlock()
+			case !errors.Is(err, limit.ErrConcurrencyExceeded):
+				t.Errorf("Reserve: %v", err)
+			}
+		})
+	}
+	wg.Wait()
+	if len(granted) != maxInflight {
+		t.Fatalf("%d reservations granted, want %d", len(granted), maxInflight)
+	}
+	for _, r := range granted {
+		if err := r.Settle(ctx, 1); err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+	}
+	for range maxInflight {
+		mustReserve(t, l, 1)
+	}
 }

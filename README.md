@@ -46,10 +46,11 @@ TW_UPSTREAM_URL=http://127.0.0.1:8081 TW_UPSTREAM_KEY=sk-ant-test-mock \
 ```
 
 The upstream URL and key come from the environment only. The key file holds
-SHA-256 hashes of gateway keys. `-no-budgets` turns the token budgets off;
+SHA-256 hashes of gateway keys; with `-db-keys`, the gateway reads them from
+Postgres instead. `-no-budgets` turns the token budgets off;
 without it, the gateway needs a Postgres URL in `TW_DATABASE_URL`.
 `docker compose -f deploy/compose.yaml up --build` starts the full stack with
-Postgres and demo budgets. See [docs/tokenwarden.md](docs/tokenwarden.md)
+Postgres, demo keys, and demo budgets. See [docs/tokenwarden.md](docs/tokenwarden.md)
 for the key-file format, how to hash a key, token budgets, the flags, and the
 metric names.
 

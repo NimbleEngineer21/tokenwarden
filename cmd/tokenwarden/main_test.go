@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -99,7 +100,10 @@ func TestConfigErrors(t *testing.T) {
 		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set", nil, false},
 		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set", nil, false},
 		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL", nil, false},
-		{"no keys flag", nil, env, "-keys is required", nil, false},
+		{"no keys flag", nil, env, "-keys or -db-keys is required", nil, false},
+		{"both key sources", []string{"-keys", good, "-db-keys"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "-keys and -db-keys are both set", nil, true},
+		{"db keys without database", []string{"-db-keys"}, env, "-db-keys reads the keys from it", nil, false},
+		{"db keys, database down", []string{"-db-keys"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "database: ", nil, false},
 		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "-keys", fs.ErrNotExist, false},
 		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file", nil, false},
 		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field", nil, false},
@@ -113,7 +117,7 @@ func TestConfigErrors(t *testing.T) {
 		{"no database", []string{"-keys", good}, env, "TW_DATABASE_URL is not set", nil, true},
 		{"database and no-budgets", []string{"-keys", good, "-no-budgets"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "both set", nil, true},
 		{"bad database URL", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@[::1/tw"), "not a valid Postgres connection string", nil, true},
-		{"database down", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "budget database", nil, true},
+		{"database down", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "database: ", nil, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -170,9 +174,20 @@ type gatewayUnderTest struct {
 	upstream *httptest.Server
 }
 
-// startGateway starts the gateway. An empty dbURL runs it with
-// -no-budgets.
+// startGateway starts the gateway with a key file. An empty dbURL runs it
+// with -no-budgets.
 func startGateway(t *testing.T, dbURL string) *gatewayUnderTest {
+	t.Helper()
+	args := []string{"-keys", keyFile(t)}
+	if dbURL == "" {
+		args = append(args, "-no-budgets")
+	}
+	return startGatewayArgs(t, args, dbURL)
+}
+
+// startGatewayArgs starts the gateway with args. A non-empty dbURL goes in
+// TW_DATABASE_URL.
+func startGatewayArgs(t *testing.T, args []string, dbURL string) *gatewayUnderTest {
 	t.Helper()
 	m := mock.New(mock.Config{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -184,10 +199,7 @@ func startGateway(t *testing.T, dbURL string) *gatewayUnderTest {
 	}))
 	t.Cleanup(upstream.Close)
 	env := map[string]string{"TW_UPSTREAM_URL": upstream.URL, "TW_UPSTREAM_KEY": upstreamKey}
-	args := []string{"-keys", keyFile(t)}
-	if dbURL == "" {
-		args = append(args, "-no-budgets")
-	} else {
+	if dbURL != "" {
 		env = withDB(env, dbURL)
 	}
 	cfg, err := parseConfig(args, envOf(env), io.Discard)
@@ -438,6 +450,59 @@ func TestBudgets(t *testing.T) {
 	}
 	if strings.Contains(g.logs.String(), dbPassword) {
 		t.Error("logs hold the database password")
+	}
+}
+
+// TestDBKeys runs the gateway with -db-keys, with and without budgets: it
+// starts with no keys, and a key added, revoked, or unknown takes effect on
+// the next request.
+func TestDBKeys(t *testing.T) {
+	for _, noBudgets := range []bool{false, true} {
+		t.Run(fmt.Sprintf("no-budgets=%v", noBudgets), func(t *testing.T) {
+			dbURL := pgtest.URL(t)
+			args := []string{"-db-keys"}
+			if noBudgets {
+				args = append(args, "-no-budgets")
+			}
+			g := startGatewayArgs(t, args, dbURL)
+			if !strings.Contains(g.logs.String(), "the database holds no active gateway keys") {
+				t.Errorf("logs lack the no-keys warning:\n%s", g.logs.String())
+			}
+			if code, _ := g.send(t, false); code != http.StatusUnauthorized {
+				t.Fatalf("before any key = %d, want 401", code)
+			}
+
+			pool, err := pgxpool.New(t.Context(), dbURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			exec := func(sql string, args ...any) {
+				t.Helper()
+				if _, err := pool.Exec(t.Context(), sql, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			exec("INSERT INTO gateway_keys (sha256, team, user_name) VALUES ($1, 'red', 'alice')", auth.HashKey(gatewayKey))
+			if !noBudgets {
+				if err := postgres.New(pool).SetBudget(t.Context(), "red", limit.Budget{Tokens: 600, Window: time.Hour}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if code, body := g.send(t, false); code != http.StatusOK {
+				t.Fatalf("with a key = %d:\n%s", code, body)
+			}
+			exec("UPDATE gateway_keys SET revoked_at = now()")
+			if code, _ := g.send(t, false); code != http.StatusUnauthorized {
+				t.Fatalf("after revoke = %d, want 401", code)
+			}
+			logs := g.logs.String()
+			for _, secret := range []string{gatewayKey, auth.HashKey(gatewayKey), dbPassword} {
+				if strings.Contains(logs, secret) {
+					t.Errorf("logs hold %q", secret)
+				}
+			}
+		})
 	}
 }
 

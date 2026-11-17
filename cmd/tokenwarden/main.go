@@ -1,10 +1,10 @@
 // Command tokenwarden is the reference gateway. It proxies the Anthropic
-// Messages API, authenticates clients with gateway keys from a key file,
-// enforces each team's token budget, and writes one audit log line per
-// request.
+// Messages API, authenticates clients with gateway keys from a key file
+// or from Postgres, enforces each team's token budget, and writes one
+// audit log line per request.
 //
 // The upstream URL and key come from the environment variables
-// TW_UPSTREAM_URL and TW_UPSTREAM_KEY, and the budget database from
+// TW_UPSTREAM_URL and TW_UPSTREAM_KEY, and the database from
 // TW_DATABASE_URL, never from flags, so that no secret shows in the process
 // list or in shell history. Prometheus metrics are served on a separate
 // listener, never on the proxy port. See docs/tokenwarden.md.
@@ -32,6 +32,7 @@ import (
 
 	"github.com/NimbleEngineer21/tokenwarden/audit"
 	"github.com/NimbleEngineer21/tokenwarden/auth"
+	authpg "github.com/NimbleEngineer21/tokenwarden/auth/postgres"
 	"github.com/NimbleEngineer21/tokenwarden/gateway"
 	"github.com/NimbleEngineer21/tokenwarden/limit"
 	"github.com/NimbleEngineer21/tokenwarden/limit/postgres"
@@ -77,6 +78,7 @@ type config struct {
 	upstreamKey string
 	databaseURL string
 	noBudgets   bool
+	dbKeys      bool
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) error {
@@ -113,7 +115,8 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.SetOutput(stderr)
 	fs.StringVar(&cfg.addr, "addr", "127.0.0.1:8080", "proxy listen address")
 	fs.StringVar(&cfg.metricsAddr, "metrics-addr", "127.0.0.1:9090", "metrics listen address; must use a port other than -addr")
-	fs.StringVar(&cfg.keysPath, "keys", "", "JSON key file of SHA-256 gateway key hashes (required)")
+	fs.StringVar(&cfg.keysPath, "keys", "", "JSON key file of SHA-256 gateway key hashes; give this or -db-keys")
+	fs.BoolVar(&cfg.dbKeys, "db-keys", false, "read gateway keys from the database of TW_DATABASE_URL; give this or -keys")
 	fs.BoolVar(&cfg.noBudgets, "no-budgets", false, "enforce no token budgets; required when TW_DATABASE_URL is not set")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -134,12 +137,18 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 		return config{}, errors.New("TW_UPSTREAM_URL is not set")
 	case cfg.upstreamKey == "":
 		return config{}, errors.New("TW_UPSTREAM_KEY is not set")
-	case cfg.keysPath == "":
-		return config{}, errors.New("-keys is required")
+	case cfg.keysPath == "" && !cfg.dbKeys:
+		return config{}, errors.New("-keys or -db-keys is required")
+	case cfg.keysPath != "" && cfg.dbKeys:
+		return config{}, errors.New("-keys and -db-keys are both set; use one")
+	case cfg.databaseURL == "" && cfg.dbKeys:
+		return config{}, errors.New("TW_DATABASE_URL is not set; -db-keys reads the keys from it")
 	// A gateway without budgets must be a choice, never a missing variable.
 	case cfg.databaseURL == "" && !cfg.noBudgets:
 		return config{}, errors.New("TW_DATABASE_URL is not set; set it, or pass -no-budgets to run without token budgets")
-	case cfg.databaseURL != "" && cfg.noBudgets:
+	// With -db-keys the database holds the keys, so -no-budgets with it is
+	// a gateway with keys in Postgres and no budgets.
+	case cfg.databaseURL != "" && cfg.noBudgets && !cfg.dbKeys:
 		return config{}, errors.New("-no-budgets and TW_DATABASE_URL are both set; use one")
 	}
 	proxyPort, err := port(cfg.addr)
@@ -172,7 +181,7 @@ func port(addr string) (int, error) {
 	return n, nil
 }
 
-func loadKeys(path string) (*auth.Static, error) {
+func loadKeys(path string, log *slog.Logger) (*auth.Static, error) {
 	f, err := os.Open(path) //nolint:gosec // The operator names the key file; it is not request input.
 	if err != nil {
 		return nil, fmt.Errorf("-keys: %w", err)
@@ -186,28 +195,46 @@ func loadKeys(path string) (*auth.Static, error) {
 	if s.Len() == 0 {
 		return nil, fmt.Errorf("-keys %s: the file holds no keys", path)
 	}
+	log.Info("loaded gateway keys", "count", s.Len())
 	return s, nil
 }
 
-// openLimiter connects to the budget database, migrates it, and returns a
-// limiter on it and a func that closes the connections. The error never
-// holds the database URL, which can hold a password.
-func openLimiter(ctx context.Context, dbURL string, opts ...postgres.Option) (*postgres.Limiter, func(), error) {
+// openDB connects to the database, migrates it, and returns the pool. The
+// error never holds the database URL, which can hold a password.
+func openDB(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 	pcfg, err := pgxpool.ParseConfig(dbURL)
 	if err != nil {
-		return nil, nil, errors.New("TW_DATABASE_URL is not a valid Postgres connection string")
+		return nil, errors.New("TW_DATABASE_URL is not a valid Postgres connection string")
 	}
 	ctx, cancel := context.WithTimeout(ctx, dbStartTimeout)
 	defer cancel()
 	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("budget database: %w", err)
+		return nil, fmt.Errorf("database: %w", err)
 	}
 	if err := postgres.Migrate(ctx, pool); err != nil {
 		pool.Close()
-		return nil, nil, fmt.Errorf("budget database: %w", err)
+		return nil, fmt.Errorf("database: %w", err)
 	}
-	return postgres.New(pool, opts...), pool.Close, nil
+	return pool, nil
+}
+
+// dbKeys returns the key store of pool. It logs the number of active keys.
+// Zero is a warning, not an error: in a new deployment the keys are added
+// after the first gateway creates the schema.
+func dbKeys(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (auth.Authenticator, error) {
+	a := authpg.New(pool)
+	ctx, cancel := context.WithTimeout(ctx, dbStartTimeout)
+	defer cancel()
+	n, err := a.Count(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("database: %w", err)
+	}
+	if n == 0 {
+		log.WarnContext(ctx, "the database holds no active gateway keys; every request gets 401 until one is added")
+	}
+	log.InfoContext(ctx, "reading gateway keys from the database", "count", n)
+	return a, nil
 }
 
 // startLeases starts the limiter's lease loop and returns a func that stops
@@ -229,12 +256,8 @@ func startLeases(ctx context.Context, l *postgres.Limiter, closePool func()) fun
 }
 
 // handlers returns the proxy handler, the metrics handler, and a func that
-// closes the budget database. Each call has its own metrics registry.
+// closes the database. Each call has its own metrics registry.
 func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics http.Handler, closeDB func(), err error) {
-	keys, err := loadKeys(cfg.keysPath)
-	if err != nil {
-		return nil, nil, nil, err
-	}
 	reg := prometheus.NewRegistry()
 	if err := errors.Join(
 		reg.Register(collectors.NewGoCollector()),
@@ -242,10 +265,31 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 	); err != nil {
 		return nil, nil, nil, err
 	}
+	// A bad key file fails before any database connect.
+	var keys auth.Authenticator
+	if !cfg.dbKeys {
+		if keys, err = loadKeys(cfg.keysPath, log); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	// One pool serves the keys and the budgets.
+	var pool *pgxpool.Pool
+	closeDB = func() {}
+	if cfg.dbKeys || !cfg.noBudgets {
+		if pool, err = openDB(ctx, cfg.databaseURL); err != nil {
+			return nil, nil, nil, err
+		}
+		closeDB = pool.Close
+	}
+	if cfg.dbKeys {
+		if keys, err = dbKeys(ctx, pool, log); err != nil {
+			closeDB()
+			return nil, nil, nil, err
+		}
+	}
 	// A nil interface, not a nil *postgres.Limiter: the gateway checks the
 	// interface for nil.
 	var limiter limit.Limiter
-	closeDB = func() {}
 	if cfg.noBudgets {
 		log.WarnContext(ctx, "token budgets are off (-no-budgets)")
 	} else {
@@ -258,18 +302,16 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 			Help: "Tokens that reaped reservations held, charged to their windows.",
 		})
 		if err := errors.Join(reg.Register(reaped), reg.Register(reapedTokens)); err != nil {
+			closeDB()
 			return nil, nil, nil, err
 		}
-		l, closePool, err := openLimiter(ctx, cfg.databaseURL,
+		l := postgres.New(pool,
 			postgres.WithLogger(log),
 			postgres.WithReapFunc(func(n int, tokens int64) {
 				reaped.Add(float64(n))
 				reapedTokens.Add(float64(tokens))
 			}))
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		limiter, closeDB = l, startLeases(ctx, l, closePool)
+		limiter, closeDB = l, startLeases(ctx, l, pool.Close)
 	}
 	gw, err := gateway.New(gateway.Config{
 		UpstreamURL:   cfg.upstreamURL,
@@ -284,7 +326,6 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 		closeDB()
 		return nil, nil, nil, err
 	}
-	log.InfoContext(ctx, "loaded gateway keys", "count", keys.Len())
 
 	pm := http.NewServeMux()
 	pm.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {

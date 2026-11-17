@@ -6,6 +6,8 @@ package db
 
 import (
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 type Budget struct {
@@ -14,6 +16,14 @@ type Budget struct {
 	WindowUs    int64
 	MaxInflight int64
 	Inflight    int64
+}
+
+type GatewayKey struct {
+	Sha256    string
+	Team      string
+	UserName  string
+	CreatedAt time.Time
+	RevokedAt pgtype.Timestamptz
 }
 
 type Reservation struct {

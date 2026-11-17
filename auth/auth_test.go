@@ -84,3 +84,13 @@ func TestLoadStatic(t *testing.T) {
 		})
 	}
 }
+
+func TestKeyID(t *testing.T) {
+	h := HashKey("tw_test_example")
+	if got := KeyID(h); got != h[:12] {
+		t.Errorf("KeyID = %q, want %q", got, h[:12])
+	}
+	if got := KeyID("abc"); got != "abc" {
+		t.Errorf("KeyID(short) = %q, want abc", got)
+	}
+}

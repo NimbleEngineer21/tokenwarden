@@ -16,9 +16,13 @@ Date: YYYY-MM-DD
 ## Context
 ## Decision
 ## Consequences
+## Alternatives
 ```
 
 ## Index
 
 | ADR | Title | Status |
 |---|---|---|
+| [0001](0001-reservation-design.md) | Reserve, top up, and settle token budgets | accepted |
+| [0002](0002-fail-closed.md) | Fail closed when the budget is unknown | accepted |
+| [0003](0003-hot-row-and-leases.md) | One counter row for each team window, with leased reservations | accepted |

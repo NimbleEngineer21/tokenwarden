@@ -96,6 +96,53 @@ func Migrate(ctx context.Context, db Beginner) error {
 	return nil
 }
 
+// Querier runs a query. A *pgxpool.Pool and a [*pgx.Conn] implement it.
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// CheckVersion returns nil if the database has exactly the migrations that
+// this build embeds. Tools that must not change the schema call it instead
+// of [Migrate]. The error says which side to upgrade.
+func CheckVersion(ctx context.Context, db Querier) error {
+	ms, err := migrations()
+	if err != nil {
+		return err
+	}
+	// The table check runs first: a query on a missing table fails at
+	// parse time, with an error that does not say what to do.
+	rows, err := db.Query(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL")
+	if err != nil {
+		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	exists, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	if err != nil {
+		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	if !exists {
+		return errors.New("store: the database has no tokenwarden schema; start tokenwarden once to create it")
+	}
+	rows, err = db.Query(ctx, "SELECT version FROM schema_migrations")
+	if err != nil {
+		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	applied, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return fmt.Errorf("store: read schema version: %w", err)
+	}
+	for _, v := range applied {
+		if !slices.ContainsFunc(ms, func(m migration) bool { return m.version == v }) {
+			return fmt.Errorf("store: the database has schema version %d, which this build does not know; upgrade this tool", v)
+		}
+	}
+	for _, m := range ms {
+		if !slices.Contains(applied, m.version) {
+			return fmt.Errorf("store: the database lacks migration %s; upgrade and start tokenwarden first", m.name)
+		}
+	}
+	return nil
+}
+
 // migrations returns the embedded migrations sorted by version. A file name
 // is a positive version number, an underscore, a name, and ".sql".
 func migrations() ([]migration, error) {

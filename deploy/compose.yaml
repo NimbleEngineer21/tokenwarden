@@ -146,6 +146,21 @@ services:
     profiles: [tools]
     networks: [internal, edge]
 
+  # The admin tool, on the database network only:
+  #   docker compose -f deploy/compose.yaml run --rm wardenctl budgets list
+  wardenctl:
+    build:
+      context: ..
+      target: wardenctl
+    image: tokenwarden-wardenctl:local
+    profiles: [tools]
+    environment:
+      TW_DATABASE_URL: *database-url
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    networks: [db]
+
 volumes:
   pgdata: {}
 

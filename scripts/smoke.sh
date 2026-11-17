@@ -1,9 +1,9 @@
 #!/bin/sh
 # Smoke test for deploy/compose.yaml: start the stack, send one stream and one
 # non-stream request through each gateway replica, check the audit lines and
-# the metrics, run team blue past its token budget, check that the internal
-# ports are not published, then stop the stack. Needs Docker with Compose v2
-# and curl. Run it from the repo root.
+# the metrics, list the budgets with wardenctl, run team blue past its token
+# budget, check that the internal ports are not published, then stop the
+# stack. Needs Docker with Compose v2 and curl. Run it from the repo root.
 set -eu
 
 compose() { docker compose -f deploy/compose.yaml "$@"; }
@@ -46,6 +46,13 @@ seed_id=$(compose ps -aq seed)
 [ -n "$seed_id" ] || fail "the seed service has no container"
 [ "$(docker wait "$seed_id")" = 0 ] || fail "the seed service failed"
 echo "smoke: the budgets are seeded"
+
+budgets=$(compose --profile tools run --rm -q --build wardenctl budgets list) ||
+	fail "wardenctl budgets list failed"
+printf '%s\n' "$budgets" | grep -Eq '^blue +600 +1m +2$' ||
+	fail "wardenctl does not list the blue budget:
+$budgets"
+echo "smoke: wardenctl lists the budgets"
 
 request() { # port key stream max_tokens [curl options]
 	# sh has no local variables; the names must not clash with the callers'.

@@ -76,3 +76,40 @@ func TestMigrateRejectsNewerDatabase(t *testing.T) {
 		t.Fatalf("err = %v, want unknown version 999999", err)
 	}
 }
+
+func TestCheckVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		migrate bool
+		change  string
+		want    string
+	}{
+		{"empty database", false, "", "no tokenwarden schema"},
+		{"current", true, "", ""},
+		{"older database", true, "DELETE FROM schema_migrations WHERE version = (SELECT max(version) FROM schema_migrations)", "lacks migration"},
+		{"newer database", true, "INSERT INTO schema_migrations (version) VALUES (999999)", "version 999999"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := pgtest.New(t)
+			ctx := t.Context()
+			if tt.migrate {
+				if err := store.Migrate(ctx, pool); err != nil {
+					t.Fatalf("Migrate: %v", err)
+				}
+			}
+			if tt.change != "" {
+				if _, err := pool.Exec(ctx, tt.change); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := store.CheckVersion(ctx, pool)
+			switch {
+			case tt.want == "" && err != nil:
+				t.Fatalf("err = %v, want nil", err)
+			case tt.want != "" && (err == nil || !strings.Contains(err.Error(), tt.want)):
+				t.Fatalf("err = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}

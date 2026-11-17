@@ -1,5 +1,5 @@
-# Two gateway replicas, the mock upstream, and Postgres for the shared token
-# budgets. See docs/tokenwarden.md.
+# Two gateway replicas, the mock upstream, and Postgres for the shared
+# gateway keys and token budgets. See docs/tokenwarden.md.
 #
 #   docker compose -f deploy/compose.yaml up --build
 #
@@ -21,9 +21,7 @@ x-gateway: &gateway
     context: ..
     target: tokenwarden
   image: tokenwarden:local
-  command: ["-keys", "/etc/tokenwarden/keys.json"]
-  volumes:
-    - ./keys.json:/etc/tokenwarden/keys.json:ro
+  command: ["-db-keys"]
   read_only: true
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]
@@ -65,25 +63,27 @@ services:
       retries: 60
     networks: [db]
 
-  # Sets the demo budgets once a gateway has created the schema, then exits.
+  # Sets the demo keys and budgets once a gateway has created the schema,
+  # then exits.
   seed:
     <<: *postgres-image
     entrypoint: ["sh", "-c"]
     command:
       - |
         i=0
-        until [ "$$(psql -tAc "SELECT to_regclass('budgets') IS NOT NULL")" = t ]; do
+        until [ "$$(psql -tAc "SELECT to_regclass('gateway_keys') IS NOT NULL")" = t ]; do
           i=$$((i + 1))
-          [ "$$i" -lt 60 ] || { echo "seed: no budgets table after 60 s" >&2; exit 1; }
+          [ "$$i" -lt 60 ] || { echo "seed: no gateway_keys table after 60 s" >&2; exit 1; }
           sleep 1
         done
-        psql -v ON_ERROR_STOP=1 -f /seed/budgets.sql
+        psql -v ON_ERROR_STOP=1 -1 -f /seed/keys.sql -f /seed/budgets.sql
     environment:
       PGHOST: postgres
       PGUSER: tokenwarden
       PGPASSWORD: tw_test_pgdemo
       PGDATABASE: tokenwarden
     volumes:
+      - ./keys.sql:/seed/keys.sql:ro
       - ./budgets.sql:/seed/budgets.sql:ro
     user: postgres
     read_only: true

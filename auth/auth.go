@@ -49,6 +49,15 @@ func HashKey(key string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// KeyID returns the key ID of a key hash from [HashKey]: its first 12 hex
+// characters. A hash shorter than that is returned whole.
+func KeyID(hash string) string {
+	if len(hash) < keyIDLen {
+		return hash
+	}
+	return hash[:keyIDLen]
+}
+
 // Static is an in-memory [Authenticator] built from a fixed key list. It is
 // safe for concurrent use.
 type Static struct {
@@ -79,7 +88,7 @@ func NewStatic(keys []StaticKey) (*Static, error) {
 		if _, dup := s.byHash[k.SHA256]; dup {
 			return nil, fmt.Errorf("auth: key %d: duplicate sha256", i)
 		}
-		s.byHash[k.SHA256] = Identity{KeyID: k.SHA256[:keyIDLen], Team: k.Team, User: k.User}
+		s.byHash[k.SHA256] = Identity{KeyID: KeyID(k.SHA256), Team: k.Team, User: k.User}
 	}
 	return s, nil
 }

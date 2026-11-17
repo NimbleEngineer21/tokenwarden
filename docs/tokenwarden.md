@@ -53,11 +53,12 @@ docker compose -f deploy/compose.yaml up --build
 | `gateway-a-real` | `127.0.0.1:8180` | `https://api.anthropic.com` (profile `real`) |
 | `gateway-b-real` | `127.0.0.1:8182` | `https://api.anthropic.com` (profile `real`) |
 
-`deploy/keys.json` holds two test keys: `tw_test_red_alice` (team `red`) and
-`tw_test_blue_bob` (team `blue`).
+The gateways read their keys from Postgres (`-db-keys`). There are two test
+keys: `tw_test_red_alice` (team `red`) and `tw_test_blue_bob` (team `blue`).
 
 The `seed` service waits until a gateway creates the schema, and then runs
-`deploy/budgets.sql`. It does not change a budget that is already set.
+`deploy/keys.sql` and `deploy/budgets.sql` in one transaction. It does not
+change a key or a budget that is already set.
 
 | Team | Budget |
 |---|---|
@@ -110,20 +111,21 @@ in shell history. The gateway does not start when `TW_UPSTREAM_URL` or
 |---|---|
 | `TW_UPSTREAM_URL` | Base URL of the upstream, for example `https://api.anthropic.com`. The gateway appends `/v1/messages`. |
 | `TW_UPSTREAM_KEY` | The upstream API key. The gateway sends it in `x-api-key`. |
-| `TW_DATABASE_URL` | Postgres connection URL of the budget database, for example `postgres://tokenwarden@db.internal:5432/tokenwarden`. Required unless `-no-budgets` is given. |
+| `TW_DATABASE_URL` | Postgres connection URL of the database of budgets and, with `-db-keys`, of keys, for example `postgres://tokenwarden@db.internal:5432/tokenwarden`. Required with `-db-keys`, and without `-no-budgets`. |
 
 | Flag | Default | Value |
 |---|---|---|
 | `-addr` | `127.0.0.1:8080` | Proxy listen address. |
 | `-metrics-addr` | `127.0.0.1:9090` | Metrics listen address. It must use a port other than `-addr`. |
-| `-keys` | none (required) | Path of the key file. |
-| `-no-budgets` | off | Enforce no token budgets. The gateway does not start when this flag and `TW_DATABASE_URL` are both set, or when neither is set. |
+| `-keys` | none | Path of the [key file](#key-file). Give this flag or `-db-keys`, not both. |
+| `-db-keys` | off | Read the keys from the database of `TW_DATABASE_URL` ([Keys in Postgres](#keys-in-postgres)). |
+| `-no-budgets` | off | Enforce no token budgets. Without `-db-keys`, the gateway does not start when this flag and `TW_DATABASE_URL` are both set, or when neither is set. With `-db-keys`, the database holds only the keys. |
 
 The gateway does not start when:
 
 - The key file is missing, is not valid, or holds no keys.
-- The budget database is not available within 30 seconds, or a newer
-  release of the gateway migrated it.
+- The database is not available within 30 seconds, or a newer release of
+  the gateway migrated it.
 
 On SIGINT or SIGTERM, the gateway stops accepting connections and lets open
 requests run for 10 seconds. Then it cuts the streams that are still open,
@@ -179,7 +181,45 @@ The gateway logs a key as `key_id`: the first 12 hex characters of its hash.
 
    On Linux, `sha256sum` gives the same output as `shasum -a 256`.
 
-3. Put the hash in the key file and restart the gateway.
+3. Put the hash in the key file and restart the gateway, or add it to the
+   database ([Keys in Postgres](#keys-in-postgres)).
+
+## Keys in Postgres
+
+With `-db-keys`, the gateway reads the keys from the `gateway_keys` table.
+All replicas share the table, and a change needs no restart. The table
+holds the hash of each key, never the key:
+
+| Column | Value |
+|---|---|
+| `sha256` | The hash of the key, as in the key file. Primary key. |
+| `team` | The team of the key. Required. |
+| `user_name` | The user of the key. Empty when not set. |
+| `created_at` | When the row was added. |
+| `revoked_at` | When the key was revoked, or null. |
+
+Each request reads its key with one primary-key query, with no cache. So a
+new key works, and a revoked key fails, from the next request on. A
+database failure gives 500 `api_error`, never access.
+
+Add a key with its hash ([Make and hash a key](#make-and-hash-a-key)):
+
+```sql
+INSERT INTO gateway_keys (sha256, team, user_name)
+VALUES ('5f08e825ca7b5a5a125e1cdae3abb568648ede29d8c679cd0f46f5f04aab7387', 'red', 'alice');
+```
+
+Revoke a key. The row stays, so an old audit line with its `key_id` still
+names its team and user:
+
+```sql
+UPDATE gateway_keys SET revoked_at = now()
+WHERE sha256 = '5f08e825ca7b5a5a125e1cdae3abb568648ede29d8c679cd0f46f5f04aab7387';
+```
+
+At start, the gateway logs the number of active keys. Zero is a warning,
+not an error: in a new deployment, the keys are added after the first
+gateway creates the schema.
 
 ## Token budgets
 

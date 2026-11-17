@@ -1,9 +1,10 @@
 #!/bin/sh
-# Smoke test for deploy/compose.yaml: start the stack, send one stream and one
-# non-stream request through each gateway replica, check the audit lines and
-# the metrics, list the budgets with wardenctl, run team blue past its token
-# budget, check that the internal ports are not published, then stop the
-# stack. Needs Docker with Compose v2 and curl. Run it from the repo root.
+# Smoke test for deploy/compose.yaml: start the stack, check that an unknown
+# key gets 401, send one stream and one non-stream request through each
+# gateway replica, check the audit lines and the metrics, list the budgets
+# with wardenctl, run team blue past its token budget, check that the
+# internal ports are not published, then stop the stack. Needs Docker with
+# Compose v2 and curl. Run it from the repo root.
 set -eu
 
 compose() { docker compose -f deploy/compose.yaml "$@"; }
@@ -45,7 +46,7 @@ echo "smoke: both replicas are healthy"
 seed_id=$(compose ps -aq seed)
 [ -n "$seed_id" ] || fail "the seed service has no container"
 [ "$(docker wait "$seed_id")" = 0 ] || fail "the seed service failed"
-echo "smoke: the budgets are seeded"
+echo "smoke: the keys and budgets are seeded"
 
 budgets=$(compose --profile tools run --rm -q --build wardenctl budgets list) ||
 	fail "wardenctl budgets list failed"
@@ -65,6 +66,16 @@ request() { # port key stream max_tokens [curl options]
 		-d "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":$r_max,\"stream\":$r_stream,\"messages\":[{\"role\":\"user\",\"content\":\"smoke\"}]}"
 }
 send() { request "$1" "$key" "$2" 32 -f; } # port stream
+
+# The gateways read their keys from Postgres (-db-keys): a seeded key works
+# on both replicas (the steps below), and a key that is not there gets 401.
+for r in $replicas; do
+	port=${r%%:*}
+	code=$(request "$port" tw_test_not_seeded false 32 -o /dev/null -w '%{http_code}') ||
+		fail "127.0.0.1:$port: the unknown-key request failed"
+	[ "$code" = 401 ] || fail "127.0.0.1:$port: an unknown key got $code, want 401"
+done
+echo "smoke: an unknown key gets 401 on both replicas"
 
 # wait_audit fails unless the logs of service $1 get an audit line that
 # matches each of the other arguments.

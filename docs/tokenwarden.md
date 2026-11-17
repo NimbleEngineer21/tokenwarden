@@ -190,9 +190,15 @@ replicas that use one database share the budgets.
 
 At start, the gateway creates or updates the schema in `TW_DATABASE_URL`.
 Replicas that start at the same time wait for each other. The gateway does
-not set budgets. Set them with SQL. `window_us` is the window length in
-microseconds. `max_inflight` is the most requests of the team that can be
-in flight at once, on all replicas together; 0 means no limit:
+not set budgets. Set them with [wardenctl](wardenctl.md):
+
+```sh
+wardenctl budgets set -team red -tokens 1000000 -window 1h -max-inflight 20
+```
+
+Or set them with SQL. `window_us` is the window length in microseconds.
+`max_inflight` is the most requests of the team that can be in flight at
+once, on all replicas together; 0 means no limit:
 
 ```sql
 INSERT INTO budgets (team, tokens, window_us, max_inflight)

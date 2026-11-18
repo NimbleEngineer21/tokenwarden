@@ -24,6 +24,29 @@ func (q *Queries) DeleteBudget(ctx context.Context, team string) (int64, error) 
 	return result.RowsAffected(), nil
 }
 
+const insertKey = `-- name: InsertKey :execrows
+INSERT INTO gateway_keys (sha256, team, user_name)
+VALUES ($1::text, $2::text, $3::text)
+ON CONFLICT ((left(sha256, 12))) DO NOTHING
+`
+
+type InsertKeyParams struct {
+	Sha256   string
+	Team     string
+	UserName string
+}
+
+// InsertKey adds a gateway key. It changes no row when a row, revoked or
+// not, has the same key ID; the unique index gateway_keys_key_id decides,
+// so two concurrent inserts cannot both win.
+func (q *Queries) InsertKey(ctx context.Context, arg InsertKeyParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertKey, arg.Sha256, arg.Team, arg.UserName)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const listBudgets = `-- name: ListBudgets :many
 
 SELECT b.team, b.tokens, b.window_us, b.max_inflight FROM budgets b ORDER BY b.team
@@ -52,6 +75,55 @@ func (q *Queries) ListBudgets(ctx context.Context) ([]ListBudgetsRow, error) {
 			&i.Tokens,
 			&i.WindowUs,
 			&i.MaxInflight,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listKeys = `-- name: ListKeys :many
+SELECT left(k.sha256, 12)::text AS key_id, k.team, k.user_name, k.created_at, k.revoked_at
+FROM gateway_keys k
+WHERE ($1::text = '' OR k.team = $1::text)
+  AND ($2::boolean OR k.revoked_at IS NULL)
+ORDER BY k.team, k.created_at, k.sha256
+`
+
+type ListKeysParams struct {
+	Team    string
+	AllKeys bool
+}
+
+type ListKeysRow struct {
+	KeyID     string
+	Team      string
+	UserName  string
+	CreatedAt time.Time
+	RevokedAt pgtype.Timestamptz
+}
+
+// ListKeys returns the gateway keys by key ID, never the full hash. It
+// returns revoked keys only when all_keys is true.
+func (q *Queries) ListKeys(ctx context.Context, arg ListKeysParams) ([]ListKeysRow, error) {
+	rows, err := q.db.Query(ctx, listKeys, arg.Team, arg.AllKeys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListKeysRow
+	for rows.Next() {
+		var i ListKeysRow
+		if err := rows.Scan(
+			&i.KeyID,
+			&i.Team,
+			&i.UserName,
+			&i.CreatedAt,
+			&i.RevokedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -125,4 +197,19 @@ func (q *Queries) ListUsage(ctx context.Context, arg ListUsageParams) ([]ListUsa
 		return nil, err
 	}
 	return items, nil
+}
+
+const revokeKey = `-- name: RevokeKey :one
+UPDATE gateway_keys SET revoked_at = now()
+WHERE left(sha256, 12) = $1::text AND revoked_at IS NULL
+RETURNING team
+`
+
+// RevokeKey revokes the active key with this key ID and returns its team.
+// The unique index allows at most one such key.
+func (q *Queries) RevokeKey(ctx context.Context, keyID string) (string, error) {
+	row := q.db.QueryRow(ctx, revokeKey, keyID)
+	var team string
+	err := row.Scan(&team)
+	return team, err
 }

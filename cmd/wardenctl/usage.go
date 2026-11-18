@@ -31,7 +31,7 @@ func usage() command {
 			}
 			return nil
 		},
-		do: func(ctx context.Context, pool *pgxpool.Pool, stdout io.Writer) error {
+		do: func(ctx context.Context, pool *pgxpool.Pool, stdout, _ io.Writer) error {
 			rows, err := db.New(pool).ListUsage(ctx, db.ListUsageParams{Team: team, Since: time.Now().Add(-since)})
 			if err != nil {
 				return fmt.Errorf("list usage: %w", err)

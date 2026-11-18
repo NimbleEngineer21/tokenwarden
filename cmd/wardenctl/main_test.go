@@ -42,7 +42,14 @@ func TestUsageErrors(t *testing.T) {
 		want  string
 	}{
 		{"no command", nil, noDB, "Usage:"},
-		{"unknown command", []string{"keys"}, noDB, "Usage:"},
+		{"unknown command", []string{"tokens"}, noDB, "Usage:"},
+		{"keys group only", []string{"keys"}, noDB, "Usage:"},
+		{"create without team", []string{"keys", "create", "-user", "a"}, noDB, "-team is required"},
+		{"revoke without id", []string{"keys", "revoke"}, noDB, "12 lowercase hex"},
+		{"revoke short id", []string{"keys", "revoke", "-id", "0123456789a"}, noDB, "12 lowercase hex"},
+		{"revoke upper-case id", []string{"keys", "revoke", "-id", "0123456789AB"}, noDB, "12 lowercase hex"},
+		{"revoke wildcard id", []string{"keys", "revoke", "-id", "%%%%%%%%%%%%"}, noDB, "12 lowercase hex"},
+		{"revoke full hash", []string{"keys", "revoke", "-id", strings.Repeat("a", 64)}, noDB, "12 lowercase hex"},
 		{"group only", []string{"budgets"}, noDB, "Usage:"},
 		{"no database", []string{"budgets", "list"}, "", "TW_DATABASE_URL is not set"},
 		{"extra argument", []string{"budgets", "list", "x"}, noDB, `unexpected argument "x"`},

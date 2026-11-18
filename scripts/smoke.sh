@@ -3,8 +3,8 @@
 # key gets 401, send one stream and one non-stream request through each
 # gateway replica, check the audit lines and the metrics, list the budgets
 # with wardenctl, run team blue past its token budget, create and revoke a
-# key with wardenctl, check that the internal ports are not published, then
-# stop the stack. Needs Docker with Compose v2 and curl. Run it from the
+# key with wardenctl, check the key's usage ledger row, check that the
+# internal ports are not published, then stop the stack. Needs Docker with Compose v2 and curl. Run it from the
 # repo root.
 set -eu
 
@@ -220,6 +220,15 @@ if compose logs --no-color | grep -qF -- "$new_key"; then
 	fail "the new key is in the logs"
 fi
 echo "smoke: wardenctl creates a key that works and revokes it"
+
+# The two requests of the new key, one on each replica, are in the usage
+# ledger under its key ID and model.
+ledger=$(ctl usage -team red -by key,model) || fail "wardenctl usage -by failed"
+echo "$ledger" | awk -v id="$new_id" \
+	'$2 == id && $3 == "claude-sonnet-4-5" && $4 == 2 && $NF > 0 { found = 1 } END { exit !found }' ||
+	fail "the usage ledger does not hold the new key's requests:
+$ledger"
+echo "smoke: the usage ledger counts the requests per key and model"
 
 # Only the proxy ports may be published, and only on 127.0.0.1. Ask Compose,
 # not the host: another local process can hold 9090 or 8081. `compose port`

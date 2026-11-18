@@ -37,7 +37,7 @@ const usageText = `Usage:
   wardenctl budgets set -team TEAM -tokens N -window DURATION
   wardenctl budgets list
   wardenctl budgets delete -team TEAM
-  wardenctl usage [-team TEAM] [-since DURATION]
+  wardenctl usage [-team TEAM] [-since DURATION] [-by key,model] [-hourly]
   wardenctl keys create -team TEAM [-user USER]
   wardenctl keys list [-team TEAM] [-all]
   wardenctl keys revoke -id KEYID

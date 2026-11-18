@@ -112,6 +112,7 @@ func TestConfigErrors(t *testing.T) {
 		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number", nil, false},
 		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number", nil, false},
 		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr", nil, false},
+		{"zero ledger retention", []string{"-keys", good, "-ledger-retention", "0s"}, env, "-ledger-retention must be positive", nil, false},
 		{"unknown flag", []string{"-keys", good, "-bogus"}, env, "flag provided but not defined: -bogus", errUsage, false},
 		{"extra argument", []string{"-keys", good, "serve"}, env, `unexpected argument "serve"`, errUsage, false},
 		{"no database", []string{"-keys", good}, env, "TW_DATABASE_URL is not set", nil, true},

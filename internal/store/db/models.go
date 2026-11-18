@@ -35,6 +35,23 @@ type Reservation struct {
 	Held        int64
 	CreatedAt   time.Time
 	ExpiresAt   time.Time
+	KeyID       string
+	Model       string
+	Hour        pgtype.Timestamptz
+}
+
+type UsageLedger struct {
+	Team             string
+	Hour             time.Time
+	KeyID            string
+	Model            string
+	Requests         int64
+	InputTokens      int64
+	OutputTokens     int64
+	CacheWriteTokens int64
+	CacheReadTokens  int64
+	EstimatedTokens  int64
+	ReapedTokens     int64
 }
 
 type UsageWindow struct {

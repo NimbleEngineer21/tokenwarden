@@ -38,6 +38,38 @@ func (q *Queries) ChargeHeld(ctx context.Context, arg ChargeHeldParams) error {
 	return err
 }
 
+const chargeLedgerReaped = `-- name: ChargeLedgerReaped :exec
+INSERT INTO usage_ledger AS ul (team, hour, key_id, model, requests, reaped_tokens)
+VALUES ($1, $2, $3, $4, $5, $6)
+ON CONFLICT (team, hour, key_id, model) DO UPDATE
+SET requests      = LEAST(ul.requests, 9223372036854775807 - EXCLUDED.requests) + EXCLUDED.requests,
+    reaped_tokens = LEAST(ul.reaped_tokens, 9223372036854775807 - EXCLUDED.reaped_tokens) + EXCLUDED.reaped_tokens
+`
+
+type ChargeLedgerReapedParams struct {
+	Team     string
+	Hour     time.Time
+	KeyID    string
+	Model    string
+	Requests int64
+	Reaped   int64
+}
+
+// ChargeLedgerReaped adds the held tokens of reaped reservations to one
+// ledger row. The reaper runs it after the window and budget updates, in
+// the same transaction. Counts saturate as in Settle.
+func (q *Queries) ChargeLedgerReaped(ctx context.Context, arg ChargeLedgerReapedParams) error {
+	_, err := q.db.Exec(ctx, chargeLedgerReaped,
+		arg.Team,
+		arg.Hour,
+		arg.KeyID,
+		arg.Model,
+		arg.Requests,
+		arg.Reaped,
+	)
+	return err
+}
+
 const claimExpired = `-- name: ClaimExpired :many
 DELETE FROM reservations res
 WHERE res.id IN (
@@ -47,7 +79,8 @@ WHERE res.id IN (
     LIMIT $2::int
     FOR UPDATE SKIP LOCKED
 )
-RETURNING res.team, res.window_start, res.window_us, res.held
+RETURNING res.team, res.window_start, res.window_us, res.held, res.key_id, res.model,
+          COALESCE(res.hour, date_trunc('hour', res.created_at, 'UTC'))::timestamptz AS hour
 `
 
 type ClaimExpiredParams struct {
@@ -60,6 +93,9 @@ type ClaimExpiredRow struct {
 	WindowStart time.Time
 	WindowUs    int64
 	Held        int64
+	KeyID       string
+	Model       string
+	Hour        time.Time
 }
 
 // ClaimExpired deletes up to max_rows reservations whose lease ended before
@@ -80,6 +116,9 @@ func (q *Queries) ClaimExpired(ctx context.Context, arg ClaimExpiredParams) ([]C
 			&i.WindowStart,
 			&i.WindowUs,
 			&i.Held,
+			&i.KeyID,
+			&i.Model,
+			&i.Hour,
 		); err != nil {
 			return nil, err
 		}
@@ -123,6 +162,20 @@ func (q *Queries) GetBudget(ctx context.Context, team string) (GetBudgetRow, err
 	var i GetBudgetRow
 	err := row.Scan(&i.Tokens, &i.WindowUs, &i.MaxInflight)
 	return i, err
+}
+
+const pruneLedger = `-- name: PruneLedger :execrows
+DELETE FROM usage_ledger WHERE hour < $1::timestamptz
+`
+
+// PruneLedger deletes the ledger rows of hours that started before the
+// given time.
+func (q *Queries) PruneLedger(ctx context.Context, before time.Time) (int64, error) {
+	result, err := q.db.Exec(ctx, pruneLedger, before)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const pruneWindows = `-- name: PruneWindows :execrows
@@ -185,14 +238,16 @@ const reserve = `-- name: Reserve :one
 WITH w AS (
     UPDATE usage_windows u
     SET reserved = u.reserved + $2::bigint
-    WHERE u.team = $4
-      AND u.window_start = $5
-      AND u.window_us = $6
+    WHERE u.team = $7
+      AND u.window_start = $8
+      AND u.window_us = $9
       AND $2::bigint <= $1::bigint - u.settled - u.reserved
     RETURNING u.team, u.window_start, u.window_us
 )
-INSERT INTO reservations (team, window_start, window_us, budget, held, expires_at)
-SELECT w.team, w.window_start, w.window_us, $1::bigint, $2::bigint, $3::timestamptz FROM w
+INSERT INTO reservations (team, window_start, window_us, budget, held, expires_at, key_id, model, hour)
+SELECT w.team, w.window_start, w.window_us, $1::bigint, $2::bigint, $3::timestamptz,
+       $4::text, $5::text, $6::timestamptz
+FROM w
 RETURNING id
 `
 
@@ -200,6 +255,9 @@ type ReserveParams struct {
 	Budget      int64
 	Tokens      int64
 	ExpiresAt   time.Time
+	KeyID       string
+	Model       string
+	Hour        time.Time
 	Team        string
 	WindowStart time.Time
 	WindowUs    int64
@@ -213,6 +271,9 @@ func (q *Queries) Reserve(ctx context.Context, arg ReserveParams) (int64, error)
 		arg.Budget,
 		arg.Tokens,
 		arg.ExpiresAt,
+		arg.KeyID,
+		arg.Model,
+		arg.Hour,
 		arg.Team,
 		arg.WindowStart,
 		arg.WindowUs,
@@ -226,7 +287,8 @@ const settle = `-- name: Settle :one
 WITH r AS (
     DELETE FROM reservations res
     WHERE res.id = $1
-    RETURNING res.team, res.window_start, res.window_us, res.held
+    RETURNING res.team, res.window_start, res.window_us, res.held, res.key_id, res.model,
+              COALESCE(res.hour, date_trunc('hour', res.created_at, 'UTC')) AS hour
 ), w AS (
     UPDATE usage_windows u
     SET reserved = u.reserved - r.held,
@@ -242,23 +304,53 @@ WITH r AS (
     FROM w
     WHERE bu.team = w.team
     RETURNING bu.team
+), l AS (
+    INSERT INTO usage_ledger AS ul (team, hour, key_id, model, requests,
+        input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, estimated_tokens)
+    SELECT r.team, r.hour, r.key_id, r.model, 1,
+        $3::bigint, $4::bigint, $5::bigint, $6::bigint, $7::bigint
+    FROM r, (SELECT count(*) FROM b) AS after_budget
+    WHERE $2::bigint > 0
+    ON CONFLICT (team, hour, key_id, model) DO UPDATE
+    SET requests           = LEAST(ul.requests, 9223372036854775806) + 1,
+        input_tokens       = LEAST(ul.input_tokens, 9223372036854775807 - EXCLUDED.input_tokens) + EXCLUDED.input_tokens,
+        output_tokens      = LEAST(ul.output_tokens, 9223372036854775807 - EXCLUDED.output_tokens) + EXCLUDED.output_tokens,
+        cache_write_tokens = LEAST(ul.cache_write_tokens, 9223372036854775807 - EXCLUDED.cache_write_tokens) + EXCLUDED.cache_write_tokens,
+        cache_read_tokens  = LEAST(ul.cache_read_tokens, 9223372036854775807 - EXCLUDED.cache_read_tokens) + EXCLUDED.cache_read_tokens,
+        estimated_tokens   = LEAST(ul.estimated_tokens, 9223372036854775807 - EXCLUDED.estimated_tokens) + EXCLUDED.estimated_tokens
 )
 SELECT w.settled FROM w
 `
 
 type SettleParams struct {
-	ID   int64
-	Used int64
+	ID         int64
+	Used       int64
+	Input      int64
+	Output     int64
+	CacheWrite int64
+	CacheRead  int64
+	Estimated  int64
 }
 
 // Settle deletes a reservation, frees what it held, charges used tokens to
-// its window, and frees its in-flight slot. It returns no row when the
-// reservation has already settled. settled saturates at the bigint maximum
-// instead of raising an overflow error. The budget update reads the window
-// update's rows, so it runs after it: rows lock in the order reservation,
-// window, budget, as in Reserve and the reaper.
+// its window, frees its in-flight slot, and adds the usage to the ledger
+// row of the reservation's hour, key ID, and model. used is the sum of the
+// five token kinds. It returns no row when the reservation has already
+// settled. Counts saturate at the bigint maximum instead of raising an
+// overflow error. The budget update reads the window update's rows, and the
+// ledger update reads the budget update's count, so rows lock in the order
+// reservation, window, budget, ledger, as in Reserve and the reaper. A
+// settle of zero tokens adds no ledger row.
 func (q *Queries) Settle(ctx context.Context, arg SettleParams) (int64, error) {
-	row := q.db.QueryRow(ctx, settle, arg.ID, arg.Used)
+	row := q.db.QueryRow(ctx, settle,
+		arg.ID,
+		arg.Used,
+		arg.Input,
+		arg.Output,
+		arg.CacheWrite,
+		arg.CacheRead,
+		arg.Estimated,
+	)
 	var settled int64
 	err := row.Scan(&settled)
 	return settled, err

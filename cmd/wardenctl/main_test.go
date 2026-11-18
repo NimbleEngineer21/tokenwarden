@@ -60,6 +60,8 @@ func TestUsageErrors(t *testing.T) {
 		{"delete without team", []string{"budgets", "delete"}, noDB, "-team is required"},
 		{"bad max-inflight", []string{"budgets", "set", "-team", "a", "-tokens", "1", "-window", "1h", "-max-inflight", "x"}, noDB, "must be a whole number"},
 		{"zero since", []string{"usage", "-since", "0s"}, noDB, "-since must be positive"},
+		{"bad by", []string{"usage", "-by", "key,team"}, noDB, `-by "key,team"`},
+		{"empty by field", []string{"usage", "-by", "key,"}, noDB, `-by "key,"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -255,6 +257,80 @@ func TestUsage(t *testing.T) {
 		{[]string{"-team", "red", "-since", "300000h"}, [][]string{header, red, redOld}},
 		{[]string{"-since", "300000h"}, [][]string{header, blue, blueOld, red, redOld}},
 		{[]string{"-team", "green"}, [][]string{header}},
+	}
+	for _, tt := range tests {
+		got := fields(ctl(t, dbURL, append([]string{"usage"}, tt.args...)...))
+		if !slices.EqualFunc(got, tt.want, slices.Equal) {
+			t.Errorf("usage %v =\n%q\nwant\n%q", tt.args, got, tt.want)
+		}
+	}
+}
+
+func TestUsageLedger(t *testing.T) {
+	dbURL, pool := database(t)
+	ctx := t.Context()
+	l := postgres.New(pool)
+	if err := l.SetBudget(ctx, "red", limit.Budget{Tokens: 1000, Window: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.SetBudget(ctx, "blue", limit.Budget{Tokens: 1000, Window: time.Hour}); err != nil {
+		t.Fatal(err)
+	}
+	settle := func(team string, a limit.Attribution, u limit.Usage) {
+		t.Helper()
+		r, err := l.ReserveFor(ctx, team, 10, a)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.(limit.UsageSettler).SettleUsage(ctx, u); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settle("red", limit.Attribution{KeyID: "k1", Model: "m1"}, limit.Usage{Input: 1, Output: 2, CacheWrite: 3, CacheRead: 4, Estimated: 5})
+	settle("red", limit.Attribution{KeyID: "k1", Model: "m2"}, limit.Usage{Input: 10})
+	settle("red", limit.Attribution{KeyID: "k2", Model: "m1"}, limit.Usage{Output: 100})
+	settle("blue", limit.Attribution{}, limit.Usage{Input: 7})
+
+	// Two reaped rows of team gray: the hour that ended inside the default
+	// -since of 24h, and the hour before it, which ended outside it.
+	thisHour := limit.WindowOf(time.Now(), time.Hour).Start.UTC()
+	edge := thisHour.Add(-24 * time.Hour)
+	_, err := pool.Exec(ctx, `INSERT INTO usage_ledger (team, hour, key_id, model, requests, reaped_tokens)
+		VALUES ('gray', $1, 'k3', 'm3', 1, 5), ('gray', $2, 'k3', 'm3', 1, 6)`, edge, edge.Add(-time.Hour))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hour := thisHour.Format(time.RFC3339)
+	sums := []string{"REQUESTS", "INPUT", "OUTPUT", "CACHE_WRITE", "CACHE_READ", "ESTIMATED", "REAPED", "TOTAL"}
+	head := func(cols ...string) []string { return append(cols, sums...) }
+	tests := []struct {
+		args []string
+		want [][]string
+	}{
+		{[]string{"-by", "key,model"}, [][]string{
+			head("TEAM", "KEY", "MODEL"),
+			{"blue", "-", "-", "1", "7", "0", "0", "0", "0", "0", "7"},
+			{"gray", "k3", "m3", "1", "0", "0", "0", "0", "0", "5", "5"},
+			{"red", "k1", "m1", "1", "1", "2", "3", "4", "5", "0", "15"},
+			{"red", "k1", "m2", "1", "10", "0", "0", "0", "0", "0", "10"},
+			{"red", "k2", "m1", "1", "0", "100", "0", "0", "0", "0", "100"},
+		}},
+		{[]string{"-by", "model", "-team", "red"}, [][]string{
+			head("TEAM", "MODEL"),
+			{"red", "m1", "2", "1", "102", "3", "4", "5", "0", "115"},
+			{"red", "m2", "1", "10", "0", "0", "0", "0", "0", "10"},
+		}},
+		{[]string{"-by", "key", "-hourly", "-team", "red"}, [][]string{
+			head("TEAM", "HOUR", "KEY"),
+			{"red", hour, "k1", "2", "11", "2", "3", "4", "5", "0", "25"},
+			{"red", hour, "k2", "1", "0", "100", "0", "0", "0", "0", "100"},
+		}},
+		{[]string{"-hourly", "-team", "green"}, [][]string{head("TEAM", "HOUR")}},
+		{[]string{"-hourly", "-team", "gray"}, [][]string{
+			head("TEAM", "HOUR"),
+			{"gray", edge.Format(time.RFC3339), "1", "0", "0", "0", "0", "0", "5", "5"},
+		}},
 	}
 	for _, tt := range tests {
 		got := fields(ctl(t, dbURL, append([]string{"usage"}, tt.args...)...))

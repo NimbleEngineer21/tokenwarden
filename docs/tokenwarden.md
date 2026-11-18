@@ -120,6 +120,7 @@ in shell history. The gateway does not start when `TW_UPSTREAM_URL` or
 | `-keys` | none | Path of the [key file](#key-file). Give this flag or `-db-keys`, not both. |
 | `-db-keys` | off | Read the keys from the database of `TW_DATABASE_URL` ([Keys in Postgres](#keys-in-postgres)). |
 | `-no-budgets` | off | Enforce no token budgets. Without `-db-keys`, the gateway does not start when this flag and `TW_DATABASE_URL` are both set, or when neither is set. With `-db-keys`, the database holds only the keys. |
+| `-ledger-retention` | `2160h` (90 days) | How long the usage ledger keeps the rows of an hour. It must be positive. See `wardenctl usage -by` in [wardenctl](wardenctl.md). |
 
 The gateway does not start when:
 

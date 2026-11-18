@@ -84,6 +84,14 @@ release still run:
 - **The old replica can still top up** until the reaper claims its
   reservation, because the old top-up statement does not touch `expires_at`.
 
+[`0006_usage_ledger.sql`](../../internal/store/migrations/0006_usage_ledger.sql)
+is the expand form. Its new `reservations` columns have defaults, so old
+replicas keep reserving, topping up, and settling, with no 503. Their
+settles do not write the usage ledger, so the ledger misses their requests
+until they are replaced; the budget windows still count them. When a new
+replica reaps a reservation of an old one, the ledger row has no key ID and
+no model, and its hour comes from `created_at`.
+
 The rule for a future migration: a column or table that old queries do not
 know must not make an old query write bad data. It may make the old query
 fail. A failed query is a 503, not a wrong charge.

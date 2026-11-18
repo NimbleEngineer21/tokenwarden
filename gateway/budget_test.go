@@ -526,3 +526,101 @@ func TestBudgetStreamFlushes(t *testing.T) {
 type perByte struct{ limit.ByteEstimator }
 
 func (perByte) OutputTokens(n int64) int64 { return n }
+
+// kindLimiter is a recLimiter that also takes attributions and usage by
+// kind, as limit.AttributedLimiter and limit.UsageSettler.
+type kindLimiter struct {
+	recLimiter
+	attrs  []limit.Attribution
+	usages []limit.Usage
+}
+
+func (l *kindLimiter) ReserveFor(ctx context.Context, team string, tokens int64, a limit.Attribution) (limit.Reservation, error) {
+	l.mu.Lock()
+	l.attrs = append(l.attrs, a)
+	l.mu.Unlock()
+	r, err := l.Reserve(ctx, team, tokens)
+	if err != nil {
+		return nil, err
+	}
+	return &kindReservation{recReservation: r.(*recReservation), l: l}, nil
+}
+
+type kindReservation struct {
+	*recReservation
+	l *kindLimiter
+}
+
+func (r *kindReservation) SettleUsage(ctx context.Context, u limit.Usage) error {
+	r.l.mu.Lock()
+	r.l.usages = append(r.l.usages, u)
+	r.l.mu.Unlock()
+	return r.Settle(ctx, u.Total())
+}
+
+// TestBudgetAttribution checks that a limiter that keeps a ledger gets the
+// key ID and model at reserve and the usage by kind at settle.
+func TestBudgetAttribution(t *testing.T) {
+	ml, err := memory.New(map[string]limit.Budget{"red": {Tokens: 1_000_000, Window: budgetWindow}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	kl := &kindLimiter{recLimiter: recLimiter{next: ml}}
+	s := newStack(t, upstreamKey, func(c *Config) { c.Limiter = kl })
+	resp := do(t, s.gateway.URL+"/v1/messages", streamBody, keyHeader())
+	readEvents(t, resp.Body)
+	ev := s.event(t)
+
+	kl.mu.Lock()
+	defer kl.mu.Unlock()
+	want := limit.Attribution{KeyID: ev.KeyID, Model: "claude-test"}
+	if len(kl.attrs) != 1 || kl.attrs[0] != want || want.KeyID == "" {
+		t.Errorf("attributions = %+v, want [%+v]", kl.attrs, want)
+	}
+	wantUsage := limit.Usage{
+		Input:      ev.Usage.InputTokens,
+		Output:     ev.Usage.OutputTokens,
+		CacheWrite: ev.Usage.CacheCreationInputTokens,
+		CacheRead:  ev.Usage.CacheReadInputTokens,
+	}
+	if len(kl.usages) != 1 || kl.usages[0] != wantUsage || wantUsage.Total() == 0 {
+		t.Errorf("usages = %+v, want [%+v]", kl.usages, wantUsage)
+	}
+}
+
+// heldRes is a reservation that holds a fixed count.
+type heldRes struct {
+	limit.Reservation
+	held int64
+}
+
+func (r heldRes) Reserved() int64 { return r.held }
+
+// TestBudgetUsage checks the split of a request's charge into token kinds.
+func TestBudgetUsage(t *testing.T) {
+	reported := audit.Usage{InputTokens: 10, OutputTokens: 20, CacheCreationInputTokens: 3, CacheReadInputTokens: 4}
+	tests := []struct {
+		name     string
+		ev       audit.Event
+		outBytes int64
+		want     limit.Usage
+	}{
+		{"error status", audit.Event{Status: 529, Outcome: audit.OutcomeUpstreamError, Usage: reported}, 400, limit.Usage{}},
+		{"no status", audit.Event{Outcome: audit.OutcomeCanceled}, 0, limit.Usage{}},
+		{"ok", audit.Event{Status: 200, Outcome: audit.OutcomeOK, Usage: reported}, 400, limit.Usage{Input: 10, Output: 20, CacheWrite: 3, CacheRead: 4}},
+		{"ok, output only", audit.Event{Status: 200, Outcome: audit.OutcomeOK, Usage: audit.Usage{OutputTokens: 5}}, 0, limit.Usage{Output: 5}},
+		{"ok, no usage", audit.Event{Status: 200, Outcome: audit.OutcomeOK}, 0, limit.Usage{Estimated: 70}},
+		{"cut off, output below guess", audit.Event{Status: 200, Outcome: audit.OutcomeIncomplete, Usage: reported}, 100, limit.Usage{Input: 10, Output: 20, CacheWrite: 3, CacheRead: 4, Estimated: 5}},
+		{"cut off, output above guess", audit.Event{Status: 200, Outcome: audit.OutcomeIncomplete, Usage: reported}, 80, limit.Usage{Input: 10, Output: 20, CacheWrite: 3, CacheRead: 4}},
+		{"cut off, cache read only", audit.Event{Status: 200, Outcome: audit.OutcomeIncomplete, Usage: audit.Usage{CacheReadInputTokens: 2}}, 0, limit.Usage{CacheRead: 2}},
+		{"cut off, no usage", audit.Event{Status: 200, Outcome: audit.OutcomeIncomplete}, 8, limit.Usage{Estimated: 9}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &budget{res: heldRes{held: 70}, est: limit.ByteEstimator{}, input: 7, outBytes: tt.outBytes}
+			if got := b.usage(&tt.ev); got != tt.want {
+				t.Errorf("usage = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}

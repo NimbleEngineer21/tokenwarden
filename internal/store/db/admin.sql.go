@@ -135,6 +135,90 @@ func (q *Queries) ListKeys(ctx context.Context, arg ListKeysParams) ([]ListKeysR
 	return items, nil
 }
 
+const listLedger = `-- name: ListLedger :many
+SELECT
+    l.team,
+    (CASE WHEN $1::boolean THEN l.hour ELSE 'epoch' END)::timestamptz AS hour,
+    (CASE WHEN $2::boolean THEN l.key_id ELSE '' END)::text AS key_id,
+    (CASE WHEN $3::boolean THEN l.model ELSE '' END)::text AS model,
+    LEAST(sum(l.requests), 9223372036854775807)::bigint AS requests,
+    LEAST(sum(l.input_tokens), 9223372036854775807)::bigint AS input_tokens,
+    LEAST(sum(l.output_tokens), 9223372036854775807)::bigint AS output_tokens,
+    LEAST(sum(l.cache_write_tokens), 9223372036854775807)::bigint AS cache_write_tokens,
+    LEAST(sum(l.cache_read_tokens), 9223372036854775807)::bigint AS cache_read_tokens,
+    LEAST(sum(l.estimated_tokens), 9223372036854775807)::bigint AS estimated_tokens,
+    LEAST(sum(l.reaped_tokens), 9223372036854775807)::bigint AS reaped_tokens
+FROM usage_ledger l
+WHERE ($4::text = '' OR l.team = $4::text)
+  AND l.hour + interval '1 hour' > $5::timestamptz
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2 DESC, 3, 4
+`
+
+type ListLedgerParams struct {
+	ByHour  bool
+	ByKey   bool
+	ByModel bool
+	Team    string
+	Since   time.Time
+}
+
+type ListLedgerRow struct {
+	Team             string
+	Hour             time.Time
+	KeyID            string
+	Model            string
+	Requests         int64
+	InputTokens      int64
+	OutputTokens     int64
+	CacheWriteTokens int64
+	CacheReadTokens  int64
+	EstimatedTokens  int64
+	ReapedTokens     int64
+}
+
+// ListLedger sums the usage ledger rows of hours that end after @since.
+// It groups by team, and also by hour, key ID, or model when the matching
+// flag is true; a column that is not grouped is the epoch or empty. Sums that
+// pass the bigint maximum stop at it.
+func (q *Queries) ListLedger(ctx context.Context, arg ListLedgerParams) ([]ListLedgerRow, error) {
+	rows, err := q.db.Query(ctx, listLedger,
+		arg.ByHour,
+		arg.ByKey,
+		arg.ByModel,
+		arg.Team,
+		arg.Since,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListLedgerRow
+	for rows.Next() {
+		var i ListLedgerRow
+		if err := rows.Scan(
+			&i.Team,
+			&i.Hour,
+			&i.KeyID,
+			&i.Model,
+			&i.Requests,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.CacheWriteTokens,
+			&i.CacheReadTokens,
+			&i.EstimatedTokens,
+			&i.ReapedTokens,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUsage = `-- name: ListUsage :many
 SELECT
     u.team,

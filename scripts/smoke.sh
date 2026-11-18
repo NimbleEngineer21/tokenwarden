@@ -2,7 +2,8 @@
 # Smoke test for deploy/compose.yaml: start the stack, check that an unknown
 # key gets 401, send one stream and one non-stream request through each
 # gateway replica, check the audit lines and the metrics, list the budgets
-# with wardenctl, run team blue past its token budget, create and revoke a
+# with wardenctl, check a policy deny and a SIGHUP policy reload, run team
+# blue past its token budget, create and revoke a
 # key with wardenctl, check that the internal ports are not published, then
 # stop the stack. Needs Docker with Compose v2 and curl. Run it from the
 # repo root.
@@ -56,6 +57,8 @@ printf '%s\n' "$budgets" | grep -Eq '^blue +600 +1m +2$' ||
 $budgets"
 echo "smoke: wardenctl lists the budgets"
 
+# model is the model of each request.
+model=claude-sonnet-4-5
 request() { # port key stream max_tokens [curl options]
 	# sh has no local variables; the names must not clash with the callers'.
 	r_port=$1 r_key=$2 r_stream=$3 r_max=$4
@@ -64,7 +67,7 @@ request() { # port key stream max_tokens [curl options]
 		-H "x-api-key: $r_key" \
 		-H 'anthropic-version: 2023-06-01' \
 		-H 'content-type: application/json' \
-		-d "{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":$r_max,\"stream\":$r_stream,\"messages\":[{\"role\":\"user\",\"content\":\"smoke\"}]}"
+		-d "{\"model\":\"$model\",\"max_tokens\":$r_max,\"stream\":$r_stream,\"messages\":[{\"role\":\"user\",\"content\":\"smoke\"}]}"
 }
 send() { request "$1" "$key" "$2" 32 -f; } # port stream
 
@@ -131,6 +134,45 @@ done
 # Team blue has 600 tokens per minute and at most 2 requests in flight
 # (deploy/budgets.sql).
 blue=tw_test_blue_bob
+
+# deploy/policy.yaml denies Opus models to team blue, before any budget
+# hold, so these requests cost blue no tokens. Team red may use them.
+model=claude-opus-5
+for r in $replicas; do
+	port=${r%%:*}
+	svc=${r#*:}
+	reply=$(request "$port" "$blue" false 32 -w '\n%{http_code}') ||
+		fail "$svc: the denied request failed"
+	[ "$(echo "$reply" | tail -n 1)" = 403 ] && echo "$reply" | grep -q '"permission_error"' ||
+		fail "$svc: blue with an Opus model did not get 403 permission_error:
+$reply"
+	wait_audit "$svc" '"team":"blue"' '"outcome":"policy_denied"' '"rule":"blue-no-opus"'
+	probe "http://$svc:9090/metrics" |
+		grep -q '^tokenwarden_policy_decisions_total{result="deny",rule="blue-no-opus"} 1$' ||
+		fail "$svc: tokenwarden_policy_decisions_total for blue-no-opus is not 1"
+done
+request 8080 "$key" false 32 -f -o /dev/null || fail "red with an Opus model was not allowed"
+model=claude-sonnet-4-5
+echo "smoke: the policy denies blue an Opus model on both replicas"
+
+# SIGHUP reloads the policy and does not stop the gateway.
+compose kill -s HUP gateway-a gateway-b >/dev/null
+for r in $replicas; do
+	port=${r%%:*}
+	svc=${r#*:}
+	n=0
+	until [ "$(compose logs --no-color --no-log-prefix "$svc" | grep -c '"msg":"policy loaded"')" -ge 2 ]; do
+		n=$((n + 1))
+		[ "$n" -lt 10 ] || fail "$svc: SIGHUP did not reload the policy"
+		sleep 1
+	done
+	curl -fsS -m 2 "http://127.0.0.1:$port/healthz" >/dev/null ||
+		fail "$svc: the gateway is down after SIGHUP"
+	probe "http://$svc:9090/metrics" |
+		grep -q '^tokenwarden_policy_reloads_total{result="ok"} 2$' ||
+		fail "$svc: tokenwarden_policy_reloads_total{result=\"ok\"} is not 2"
+done
+echo "smoke: SIGHUP reloads the policy on both replicas"
 
 # Two requests that the mock holds for 20 s take both slots; a third gets
 # 429 with no Retry-After. Cutting the held ones before the upstream

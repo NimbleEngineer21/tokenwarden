@@ -16,6 +16,9 @@ type metrics struct {
 	tokens   *prometheus.CounterVec
 	topUps   *prometheus.CounterVec
 	denials  *prometheus.CounterVec
+	// decisions counts policy decisions. The rule label is bounded by the
+	// rules of the policy file.
+	decisions *prometheus.CounterVec
 }
 
 func newMetrics(reg prometheus.Registerer) (*metrics, error) {
@@ -46,12 +49,16 @@ func newMetrics(reg prometheus.Registerer) (*metrics, error) {
 			Name: "tokenwarden_budget_denials_total",
 			Help: "Requests that the token budget stopped, by team and stage: reserve, concurrency, or topup.",
 		}, []string{"team", "stage"}),
+		decisions: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tokenwarden_policy_decisions_total",
+			Help: "Policy decisions by result (allow, deny, would_deny, or error) and the rule that decided.",
+		}, []string{"result", "rule"}),
 	}
 	if reg == nil {
 		return m, nil
 	}
 	var errs []error
-	for _, c := range []prometheus.Collector{m.requests, m.duration, m.active, m.tokens, m.topUps, m.denials} {
+	for _, c := range []prometheus.Collector{m.requests, m.duration, m.active, m.tokens, m.topUps, m.denials, m.decisions} {
 		errs = append(errs, reg.Register(c))
 	}
 	if err := errors.Join(errs...); err != nil {

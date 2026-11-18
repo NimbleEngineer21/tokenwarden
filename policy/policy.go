@@ -40,6 +40,9 @@ type Decision struct {
 	// WouldDeny reports that the policy runs in observe mode and would
 	// have denied the request. Allow is then true.
 	WouldDeny bool
+	// Revision names the version of the rules that decided, so that an
+	// audit record shows which file was in force. It can be empty.
+	Revision string
 }
 
 // Policy decides whether a request may go to the upstream.

@@ -30,6 +30,8 @@ type Engine struct {
 	path string
 	env  *celgo.Env
 	log  *slog.Logger
+	// onReload is called after each load attempt. It can be nil.
+	onReload func(revision string, err error)
 
 	reloadMu sync.Mutex
 	rules    atomic.Pointer[ruleSet]
@@ -42,6 +44,15 @@ type Option func(*Engine)
 // default is [slog.Default].
 func WithLogger(l *slog.Logger) Option {
 	return func(e *Engine) { e.log = l }
+}
+
+// WithReloadFunc sets a func that the engine calls after each attempt to
+// load the file: with the new revision and a nil error after a load, or
+// with an error when the engine kept its rules. [Engine.Watch] calls it only
+// when the file content changed, and only once for a file that fails. The
+// func must not call [Engine.Reload], which would deadlock.
+func WithReloadFunc(f func(revision string, err error)) Option {
+	return func(e *Engine) { e.onReload = f }
 }
 
 // Load reads and compiles the policy file at path. It returns an error if
@@ -73,9 +84,17 @@ func (e *Engine) Reload() error {
 	defer e.reloadMu.Unlock()
 	data, err := os.ReadFile(e.path)
 	if err != nil {
-		return fmt.Errorf("policy: %w", err)
+		err = fmt.Errorf("policy: %w", err)
+		e.reloaded("", err)
+		return err
 	}
 	return e.swap(data)
+}
+
+func (e *Engine) reloaded(revision string, err error) {
+	if e.onReload != nil {
+		e.onReload(revision, err)
+	}
 }
 
 // swap compiles data and makes it the active rule set. The caller holds
@@ -83,17 +102,20 @@ func (e *Engine) Reload() error {
 func (e *Engine) swap(data []byte) error {
 	rs, err := compile(e.env, data)
 	if err != nil {
-		return fmt.Errorf("policy: %s: %w", e.path, err)
+		err = fmt.Errorf("policy: %s: %w", e.path, err)
+		e.reloaded("", err)
+		return err
 	}
 	e.rules.Store(rs)
+	e.reloaded(rs.revision, nil)
 	e.log.Info("policy loaded", "path", e.path, "revision", rs.revision,
 		"mode", string(rs.mode), "rules", len(rs.rules))
 	return nil
 }
 
 // Watch polls the policy file every interval and reloads it when its
-// content changes. It logs a file that is not valid and keeps the rules
-// that it has. Watch returns when ctx is done. The interval must be
+// content changes. It logs a file that is not valid or cannot be read,
+// once until the file changes, and keeps the rules that it has. Watch returns when ctx is done. The interval must be
 // positive.
 //
 // Watch compares content, not modification times, so it also sees a file
@@ -101,7 +123,11 @@ func (e *Engine) swap(data []byte) error {
 func (e *Engine) Watch(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
+	// A failure is logged and reported once, not on every tick: failed
+	// holds the content that failed, and readFailed a file that could not
+	// be read.
 	var failed []byte
+	readFailed := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -110,10 +136,15 @@ func (e *Engine) Watch(ctx context.Context, interval time.Duration) {
 		}
 		data, err := os.ReadFile(e.path)
 		if err != nil {
-			e.log.ErrorContext(ctx, "policy reload failed", "path", e.path, "error", err)
+			if !readFailed {
+				readFailed = true
+				err = fmt.Errorf("policy: %w", err)
+				e.reloaded("", err)
+				e.log.ErrorContext(ctx, "policy reload failed", "path", e.path, "error", err)
+			}
 			continue
 		}
-		// A file that failed once is logged once, not on every tick.
+		readFailed = false
 		if bytes.Equal(data, failed) {
 			continue
 		}
@@ -142,6 +173,7 @@ func (e *Engine) Decide(ctx context.Context, in policy.Input) (policy.Decision, 
 	if err != nil {
 		return policy.Decision{}, err
 	}
+	d.Revision = rs.revision
 	if d.Allow || rs.mode != ModeObserve {
 		return d, nil
 	}

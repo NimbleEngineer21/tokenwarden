@@ -56,6 +56,20 @@ func keyFile(t *testing.T) string {
 	return writeFile(t, `{"keys":[{"sha256":"`+auth.HashKey(gatewayKey)+`","team":"red","user":"alice"}]}`)
 }
 
+// redPolicy denies Opus models to team red and allows the rest.
+const redPolicy = `version: 1
+rules:
+  - name: red-no-opus
+    match: {teams: [red]}
+    expr: request.model.startsWith("claude-opus")
+    effect: deny
+    reason: Opus models are for staff only.
+  - name: everyone
+    effect: allow
+`
+
+const denyAllPolicy = "version: 1\nrules: []\n"
+
 func envOf(m map[string]string) func(string) string {
 	return func(k string) string { return m[k] }
 }
@@ -87,6 +101,7 @@ func (s *syncBuffer) String() string {
 
 func TestConfigErrors(t *testing.T) {
 	good := keyFile(t)
+	pol := writeFile(t, redPolicy)
 	env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}
 	tests := []struct {
 		name string
@@ -96,28 +111,38 @@ func TestConfigErrors(t *testing.T) {
 		is   error
 		// db leaves out -no-budgets.
 		db bool
+		// pol leaves out -no-policy.
+		pol bool
 	}{
-		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set", nil, false},
-		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set", nil, false},
-		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL", nil, false},
-		{"no keys flag", nil, env, "-keys or -db-keys is required", nil, false},
-		{"both key sources", []string{"-keys", good, "-db-keys"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "-keys and -db-keys are both set", nil, true},
-		{"db keys without database", []string{"-db-keys"}, env, "-db-keys reads the keys from it", nil, false},
-		{"db keys, database down", []string{"-db-keys"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "database: ", nil, false},
-		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "-keys", fs.ErrNotExist, false},
-		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file", nil, false},
-		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field", nil, false},
-		{"zero keys", []string{"-keys", writeFile(t, `{"keys":[]}`)}, env, "holds no keys", nil, false},
-		{"addr without port", []string{"-keys", good, "-addr", "127.0.0.1"}, env, "-addr", nil, false},
-		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number", nil, false},
-		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number", nil, false},
-		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr", nil, false},
-		{"unknown flag", []string{"-keys", good, "-bogus"}, env, "flag provided but not defined: -bogus", errUsage, false},
-		{"extra argument", []string{"-keys", good, "serve"}, env, `unexpected argument "serve"`, errUsage, false},
-		{"no database", []string{"-keys", good}, env, "TW_DATABASE_URL is not set", nil, true},
-		{"database and no-budgets", []string{"-keys", good, "-no-budgets"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "both set", nil, true},
-		{"bad database URL", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@[::1/tw"), "not a valid Postgres connection string", nil, true},
-		{"database down", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "database: ", nil, true},
+		{"no upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_KEY": upstreamKey}, "TW_UPSTREAM_URL is not set", nil, false, false},
+		{"no upstream key", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081"}, "TW_UPSTREAM_KEY is not set", nil, false, false},
+		{"bad upstream URL", []string{"-keys", good}, map[string]string{"TW_UPSTREAM_URL": "127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}, "upstream URL", nil, false, false},
+		{"no keys flag", nil, env, "-keys or -db-keys is required", nil, false, false},
+		{"both key sources", []string{"-keys", good, "-db-keys"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "-keys and -db-keys are both set", nil, true, false},
+		{"db keys without database", []string{"-db-keys"}, env, "-db-keys reads the keys from it", nil, false, false},
+		{"db keys, database down", []string{"-db-keys"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "database: ", nil, false, false},
+		{"missing key file", []string{"-keys", filepath.Join(t.TempDir(), "none.json")}, env, "-keys", fs.ErrNotExist, false, false},
+		{"bad JSON", []string{"-keys", writeFile(t, `{"keys":[`)}, env, "key file", nil, false, false},
+		{"unknown field", []string{"-keys", writeFile(t, `{"keys":[{"key":"tw_test_raw","team":"red"}]}`)}, env, "unknown field", nil, false, false},
+		{"zero keys", []string{"-keys", writeFile(t, `{"keys":[]}`)}, env, "holds no keys", nil, false, false},
+		{"addr without port", []string{"-keys", good, "-addr", "127.0.0.1"}, env, "-addr", nil, false, false},
+		{"addr port not a number", []string{"-keys", good, "-addr", "127.0.0.1:http"}, env, "must be a number", nil, false, false},
+		{"metrics port too large", []string{"-keys", good, "-metrics-addr", "127.0.0.1:65536"}, env, "must be a number", nil, false, false},
+		{"same port", []string{"-keys", good, "-addr", "0.0.0.0:9000", "-metrics-addr", "127.0.0.1:9000"}, env, "port other than -addr", nil, false, false},
+		{"unknown flag", []string{"-keys", good, "-bogus"}, env, "flag provided but not defined: -bogus", errUsage, false, false},
+		{"extra argument", []string{"-keys", good, "serve"}, env, `unexpected argument "serve"`, errUsage, false, false},
+		{"no database", []string{"-keys", good}, env, "TW_DATABASE_URL is not set", nil, true, false},
+		{"database and no-budgets", []string{"-keys", good, "-no-budgets"}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw"), "both set", nil, true, false},
+		{"bad database URL", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@[::1/tw"), "not a valid Postgres connection string", nil, true, false},
+		{"database down", []string{"-keys", good}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "database: ", nil, true, false},
+		{"no policy flag", []string{"-keys", good}, env, "-policy or -no-policy is required", nil, false, true},
+		{"both policy flags", []string{"-keys", good, "-policy", pol, "-no-policy"}, env, "-policy and -no-policy are both set", nil, false, true},
+		{"poll without policy", []string{"-keys", good, "-no-policy", "-policy-poll", "1s"}, env, "-policy-poll needs -policy", nil, false, true},
+		{"negative poll", []string{"-keys", good, "-policy", pol, "-policy-poll", "-1s"}, env, "-policy-poll must not be negative", nil, false, true},
+		{"missing policy file", []string{"-keys", good, "-policy", filepath.Join(t.TempDir(), "none.yaml")}, env, "policy: open ", fs.ErrNotExist, false, true},
+		{"bad policy file", []string{"-keys", good, "-policy", writeFile(t, "version: 2\n")}, env, "version 2 is not supported", nil, false, true},
+		// The policy fails before the database connect, which would fail too.
+		{"bad policy before database", []string{"-db-keys", "-policy", writeFile(t, "version: 2\n")}, withDB(env, "postgres://tw:"+dbPassword+"@127.0.0.1:1/tw?connect_timeout=5"), "version 2 is not supported", nil, false, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -125,10 +150,13 @@ func TestConfigErrors(t *testing.T) {
 			if !tt.db {
 				args = append([]string{"-no-budgets"}, args...)
 			}
+			if !tt.pol {
+				args = append([]string{"-no-policy"}, args...)
+			}
 			var stderr bytes.Buffer
 			cfg, err := parseConfig(args, envOf(tt.env), &stderr)
 			if err == nil {
-				_, _, _, err = handlers(t.Context(), cfg, slog.New(slog.DiscardHandler))
+				_, _, _, _, err = handlers(t.Context(), cfg, slog.New(slog.DiscardHandler))
 			}
 			if err == nil {
 				t.Fatal("error = nil")
@@ -170,6 +198,7 @@ func TestHelpIsNotAnError(t *testing.T) {
 type gatewayUnderTest struct {
 	proxy    *httptest.Server
 	metrics  http.Handler
+	reload   func()
 	logs     *syncBuffer
 	upstream *httptest.Server
 }
@@ -186,9 +215,13 @@ func startGateway(t *testing.T, dbURL string) *gatewayUnderTest {
 }
 
 // startGatewayArgs starts the gateway with args. A non-empty dbURL goes in
-// TW_DATABASE_URL.
+// TW_DATABASE_URL. Without -policy or -no-policy in args, the gateway uses
+// [redPolicy] and does not poll it.
 func startGatewayArgs(t *testing.T, args []string, dbURL string) *gatewayUnderTest {
 	t.Helper()
+	if !slices.Contains(args, "-policy") && !slices.Contains(args, "-no-policy") {
+		args = append(args, "-policy", writeFile(t, redPolicy), "-policy-poll", "0")
+	}
 	m := mock.New(mock.Config{})
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("x-api-key") != upstreamKey {
@@ -207,14 +240,14 @@ func startGatewayArgs(t *testing.T, args []string, dbURL string) *gatewayUnderTe
 		t.Fatal(err)
 	}
 	logs := &syncBuffer{}
-	proxy, metrics, closeDB, err := handlers(t.Context(), cfg, slog.New(slog.NewJSONHandler(logs, nil)))
+	proxy, metrics, reload, closeDB, err := handlers(t.Context(), cfg, slog.New(slog.NewJSONHandler(logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(closeDB)
 	srv := httptest.NewServer(proxy)
 	t.Cleanup(srv.Close)
-	return &gatewayUnderTest{proxy: srv, metrics: metrics, logs: logs, upstream: upstream}
+	return &gatewayUnderTest{proxy: srv, metrics: metrics, reload: reload, logs: logs, upstream: upstream}
 }
 
 // send posts one Messages API request with max_tokens 32 and returns the
@@ -229,8 +262,14 @@ func (g *gatewayUnderTest) send(t *testing.T, stream bool) (int, string) {
 // response header, and the body.
 func (g *gatewayUnderTest) sendMax(t *testing.T, stream bool, maxTokens int) (int, http.Header, string) {
 	t.Helper()
+	return g.sendModel(t, "claude-test", stream, maxTokens)
+}
+
+// sendModel is sendMax with a model.
+func (g *gatewayUnderTest) sendModel(t *testing.T, model string, stream bool, maxTokens int) (int, http.Header, string) {
+	t.Helper()
 	body, err := json.Marshal(map[string]any{
-		"model":      "claude-test",
+		"model":      model,
 		"max_tokens": maxTokens,
 		"stream":     stream,
 		"messages":   []map[string]string{{"role": "user", "content": "hello gateway"}},
@@ -321,6 +360,10 @@ func TestEndToEnd(t *testing.T) {
 	if code != http.StatusOK || !strings.Contains(body, `"type":"message"`) {
 		t.Fatalf("non-stream reply = %d:\n%s", code, body)
 	}
+	code, _, body = g.sendModel(t, "claude-opus-5", false, 32)
+	if code != http.StatusForbidden || !strings.Contains(body, "Opus models are for staff only.") {
+		t.Fatalf("denied reply = %d:\n%s", code, body)
+	}
 
 	if code, body := g.get(t, "/healthz"); code != http.StatusOK || body != "ok\n" {
 		t.Fatalf("GET /healthz = %d %q", code, body)
@@ -337,6 +380,9 @@ func TestEndToEnd(t *testing.T) {
 		`tokenwarden_requests_total{outcome="ok",stream="true"} 1`,
 		`tokenwarden_requests_total{outcome="ok",stream="false"} 1`,
 		`tokenwarden_tokens_total{kind="output",team="red"}`,
+		`tokenwarden_policy_decisions_total{result="allow",rule="everyone"} 2`,
+		`tokenwarden_policy_decisions_total{result="deny",rule="red-no-opus"} 1`,
+		`tokenwarden_policy_reloads_total{result="ok"} 1`,
 		"go_goroutines ",
 	} {
 		if !strings.Contains(text, want) {
@@ -364,7 +410,7 @@ func TestEndToEnd(t *testing.T) {
 			audits = append(audits, rec.Outcome+"/"+rec.Team)
 		}
 	}
-	if want := []string{"ok/red", "ok/red"}; !slices.Equal(audits, want) {
+	if want := []string{"ok/red", "ok/red", "policy_denied/red"}; !slices.Equal(audits, want) {
 		t.Fatalf("audit lines = %v, want %v", audits, want)
 	}
 }
@@ -549,7 +595,7 @@ func TestRunStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}
-	args := []string{"-no-budgets", "-keys", keyFile(t), "-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}
+	args := []string{"-no-budgets", "-no-policy", "-keys", keyFile(t), "-addr", "127.0.0.1:0", "-metrics-addr", "127.0.0.1:0"}
 	var stderr syncBuffer
 	if err := run(ctx, args, envOf(env), &stderr); err != nil {
 		t.Fatalf("run = %v", err)
@@ -577,7 +623,7 @@ func TestRunFailsOnBusyPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:8081", "TW_UPSTREAM_KEY": upstreamKey}
-	args := []string{"-no-budgets", "-keys", keyFile(t), "-addr", proxyAddr, "-metrics-addr", busy.Addr().String()}
+	args := []string{"-no-budgets", "-no-policy", "-keys", keyFile(t), "-addr", proxyAddr, "-metrics-addr", busy.Addr().String()}
 	if err := run(t.Context(), args, envOf(env), io.Discard); err == nil {
 		t.Fatal("run on a busy metrics port = nil, want an error")
 	}
@@ -793,4 +839,127 @@ func TestServeCutsStreamsAfterGrace(t *testing.T) {
 			t.Fatalf("logs = %v, want %v", warns, want)
 		}
 	})
+}
+
+// writeTo replaces the content of the file at path.
+func writeTo(t *testing.T, path, data string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPolicyReload(t *testing.T) {
+	path := writeFile(t, redPolicy)
+	g := startGatewayArgs(t, []string{"-keys", keyFile(t), "-no-budgets", "-policy", path, "-policy-poll", "0"}, "")
+	if code, body := g.send(t, false); code != http.StatusOK {
+		t.Fatalf("before reload = %d:\n%s", code, body)
+	}
+
+	writeTo(t, path, denyAllPolicy)
+	g.reload()
+	if code, body := g.send(t, false); code != http.StatusForbidden || !strings.Contains(body, "no rule allows this request") {
+		t.Fatalf("after reload = %d, want 403 from the default deny:\n%s", code, body)
+	}
+
+	writeTo(t, path, "version: 1\nmode: loud\n")
+	g.reload()
+	if code, _ := g.send(t, false); code != http.StatusForbidden {
+		t.Fatalf("after a bad reload = %d, want 403 from the old rules", code)
+	}
+	if !strings.Contains(g.logs.String(), "policy reload failed; the old rules stay") {
+		t.Errorf("logs lack the reload failure:\n%s", g.logs.String())
+	}
+	text := g.scrape(t)
+	for _, want := range []string{
+		`tokenwarden_policy_reloads_total{result="ok"} 2`,
+		`tokenwarden_policy_reloads_total{result="error"} 1`,
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("metrics lack %q", want)
+		}
+	}
+	m := regexp.MustCompile(`(?m)^tokenwarden_policy_last_reload_success_timestamp_seconds (\S+)$`).FindStringSubmatch(text)
+	if m == nil {
+		t.Fatal("metrics lack the last reload timestamp")
+	}
+	if ts, err := strconv.ParseFloat(m[1], 64); err != nil || time.Since(time.Unix(int64(ts), 0)) > time.Minute {
+		t.Errorf("last reload timestamp = %s, want about now", m[1])
+	}
+}
+
+// TestPolicyPoll checks that handlers watches the policy file every
+// -policy-poll, and not at all with 0.
+func TestPolicyPoll(t *testing.T) {
+	for _, tt := range []struct {
+		poll string
+		want int
+	}{
+		{"1s", http.StatusForbidden},
+		// The old rules allow the request, and the dead upstream fails it.
+		{"0", http.StatusBadGateway},
+	} {
+		t.Run(tt.poll, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				path := writeFile(t, redPolicy)
+				env := map[string]string{"TW_UPSTREAM_URL": "http://127.0.0.1:1", "TW_UPSTREAM_KEY": upstreamKey}
+				args := []string{"-keys", keyFile(t), "-no-budgets", "-policy", path, "-policy-poll", tt.poll}
+				cfg, err := parseConfig(args, envOf(env), io.Discard)
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(t.Context())
+				defer cancel()
+				proxy, _, _, closeDB, err := handlers(ctx, cfg, slog.New(slog.DiscardHandler))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer closeDB()
+				writeTo(t, path, denyAllPolicy)
+				time.Sleep(time.Second)
+				synctest.Wait()
+
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages",
+					strings.NewReader(`{"model":"claude-test","max_tokens":5,"messages":[]}`))
+				req.Header.Set("x-api-key", gatewayKey)
+				proxy.ServeHTTP(rec, req)
+				if rec.Code != tt.want {
+					t.Fatalf("status = %d, want %d", rec.Code, tt.want)
+				}
+			})
+		})
+	}
+}
+
+func TestReloadOnSignal(t *testing.T) {
+	sigs := make(chan os.Signal, 1)
+	reloads := make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		reloadOnSignal(ctx, sigs, func() { reloads <- struct{}{} })
+	}()
+	for range 2 {
+		sigs <- os.Interrupt
+		<-reloads
+	}
+	cancel()
+	<-done
+}
+
+func TestNoPolicy(t *testing.T) {
+	logs := &syncBuffer{}
+	cfg := config{noPolicy: true}
+	engine, reload, err := loadPolicy(t.Context(), cfg, nil, slog.New(slog.NewJSONHandler(logs, nil)))
+	if err != nil || engine != nil {
+		t.Fatalf("loadPolicy(-no-policy) = %v, %v; want nil, nil", engine, err)
+	}
+	reload()
+	for _, want := range []string{"the policy is off (-no-policy)", "SIGHUP: no policy to reload"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs lack %q:\n%s", want, logs.String())
+		}
+	}
 }

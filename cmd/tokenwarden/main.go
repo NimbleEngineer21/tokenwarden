@@ -1,7 +1,7 @@
 // Command tokenwarden is the reference gateway. It proxies the Anthropic
 // Messages API, authenticates clients with gateway keys from a key file
-// or from Postgres, enforces each team's token budget, and writes one
-// audit log line per request.
+// or from Postgres, asks a CEL policy file about each request, enforces
+// each team's token budget, and writes one audit log line per request.
 //
 // The upstream URL and key come from the environment variables
 // TW_UPSTREAM_URL and TW_UPSTREAM_KEY, and the database from
@@ -36,6 +36,8 @@ import (
 	"github.com/NimbleEngineer21/tokenwarden/gateway"
 	"github.com/NimbleEngineer21/tokenwarden/limit"
 	"github.com/NimbleEngineer21/tokenwarden/limit/postgres"
+	"github.com/NimbleEngineer21/tokenwarden/policy"
+	"github.com/NimbleEngineer21/tokenwarden/policy/cel"
 )
 
 // shutdownGrace is how long open requests can run after a stop signal.
@@ -79,6 +81,9 @@ type config struct {
 	databaseURL string
 	noBudgets   bool
 	dbKeys      bool
+	policyPath  string
+	noPolicy    bool
+	policyPoll  time.Duration
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) error {
@@ -90,11 +95,19 @@ func run(ctx context.Context, args []string, getenv func(string) string, stderr 
 		return err
 	}
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
-	proxy, metrics, closeDB, err := handlers(ctx, cfg, log)
+	// SIGHUP reloads the policy. Catch it before anything else, so that a
+	// SIGHUP never kills the gateway, which is the default for Go.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	proxy, metrics, reload, closeDB, err := handlers(ctx, cfg, log)
 	if err != nil {
 		return err
 	}
 	defer closeDB()
+	hupCtx, stopHUP := context.WithCancel(ctx)
+	defer stopHUP()
+	go reloadOnSignal(hupCtx, hup, reload)
 	var lc net.ListenConfig
 	proxyLn, err := lc.Listen(ctx, "tcp", cfg.addr)
 	if err != nil {
@@ -118,6 +131,9 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.StringVar(&cfg.keysPath, "keys", "", "JSON key file of SHA-256 gateway key hashes; give this or -db-keys")
 	fs.BoolVar(&cfg.dbKeys, "db-keys", false, "read gateway keys from the database of TW_DATABASE_URL; give this or -keys")
 	fs.BoolVar(&cfg.noBudgets, "no-budgets", false, "enforce no token budgets; required when TW_DATABASE_URL is not set")
+	fs.StringVar(&cfg.policyPath, "policy", "", "CEL policy file; give this or -no-policy")
+	fs.BoolVar(&cfg.noPolicy, "no-policy", false, "allow every authenticated request; give this or -policy")
+	fs.DurationVar(&cfg.policyPoll, "policy-poll", 10*time.Second, "how often to check the policy file for changes; 0 checks only on SIGHUP")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return config{}, err
@@ -129,6 +145,8 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 		fs.Usage()
 		return config{}, errUsage
 	}
+	pollSet := false
+	fs.Visit(func(f *flag.Flag) { pollSet = pollSet || f.Name == "policy-poll" })
 	cfg.upstreamURL = getenv("TW_UPSTREAM_URL")
 	cfg.upstreamKey = getenv("TW_UPSTREAM_KEY")
 	cfg.databaseURL = getenv("TW_DATABASE_URL")
@@ -150,6 +168,15 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	// a gateway with keys in Postgres and no budgets.
 	case cfg.databaseURL != "" && cfg.noBudgets && !cfg.dbKeys:
 		return config{}, errors.New("-no-budgets and TW_DATABASE_URL are both set; use one")
+	// A gateway without a policy must be a choice, the same as budgets.
+	case cfg.policyPath == "" && !cfg.noPolicy:
+		return config{}, errors.New("-policy or -no-policy is required")
+	case cfg.policyPath != "" && cfg.noPolicy:
+		return config{}, errors.New("-policy and -no-policy are both set; use one")
+	case pollSet && cfg.policyPath == "":
+		return config{}, errors.New("-policy-poll needs -policy")
+	case cfg.policyPoll < 0:
+		return config{}, errors.New("-policy-poll must not be negative")
 	}
 	proxyPort, err := port(cfg.addr)
 	if err != nil {
@@ -237,6 +264,76 @@ func dbKeys(ctx context.Context, pool *pgxpool.Pool, log *slog.Logger) (auth.Aut
 	return a, nil
 }
 
+// policyMetrics are the collectors of the policy file reloads.
+type policyMetrics struct {
+	reloads     *prometheus.CounterVec
+	lastSuccess prometheus.Gauge
+}
+
+func newPolicyMetrics(reg prometheus.Registerer) (*policyMetrics, error) {
+	m := &policyMetrics{
+		reloads: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "tokenwarden_policy_reloads_total",
+			Help: "Loads of the policy file by result: ok, or error when the gateway kept its rules.",
+		}, []string{"result"}),
+		lastSuccess: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "tokenwarden_policy_last_reload_success_timestamp_seconds",
+			Help: "Unix time of the last load of the policy file that worked.",
+		}),
+	}
+	if err := errors.Join(reg.Register(m.reloads), reg.Register(m.lastSuccess)); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func (m *policyMetrics) observe(_ string, err error) {
+	if err != nil {
+		m.reloads.WithLabelValues("error").Inc()
+		return
+	}
+	m.reloads.WithLabelValues("ok").Inc()
+	m.lastSuccess.SetToCurrentTime()
+}
+
+// loadPolicy loads the policy file of cfg and returns it with a func that
+// reloads it. With -no-policy it returns a nil engine and a func that only
+// logs.
+func loadPolicy(ctx context.Context, cfg config, reg prometheus.Registerer, log *slog.Logger) (*cel.Engine, func(), error) {
+	if cfg.noPolicy {
+		log.WarnContext(ctx, "the policy is off (-no-policy): every authenticated request is allowed")
+		return nil, func() { log.InfoContext(ctx, "SIGHUP: no policy to reload") }, nil
+	}
+	m, err := newPolicyMetrics(reg)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The error starts with "policy: <path>", so it needs no prefix.
+	e, err := cel.Load(cfg.policyPath, cel.WithLogger(log), cel.WithReloadFunc(m.observe))
+	if err != nil {
+		return nil, nil, err
+	}
+	// The engine logs a reload that works; a failed one is logged here.
+	reload := func() {
+		if err := e.Reload(); err != nil {
+			log.ErrorContext(ctx, "policy reload failed; the old rules stay", "error", err)
+		}
+	}
+	return e, reload, nil
+}
+
+// reloadOnSignal calls reload for each signal on sigs until ctx is done.
+func reloadOnSignal(ctx context.Context, sigs <-chan os.Signal, reload func()) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sigs:
+			reload()
+		}
+	}
+}
+
 // startLeases starts the limiter's lease loop and returns a func that stops
 // it and then closes the database. The loop outlives ctx, the signal
 // context, so that it renews the leases of the requests that run during the
@@ -255,36 +352,48 @@ func startLeases(ctx context.Context, l *postgres.Limiter, closePool func()) fun
 	}
 }
 
-// handlers returns the proxy handler, the metrics handler, and a func that
-// closes the database. Each call has its own metrics registry.
-func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics http.Handler, closeDB func(), err error) {
+// handlers returns the proxy handler, the metrics handler, a func that
+// reloads the policy, and a func that closes the database. Each call has its
+// own metrics registry. With a policy file and a positive -policy-poll, it
+// also watches the file until ctx is done.
+func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics http.Handler, reload, closeDB func(), err error) {
 	reg := prometheus.NewRegistry()
 	if err := errors.Join(
 		reg.Register(collectors.NewGoCollector()),
 		reg.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})),
 	); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	// A bad key file fails before any database connect.
+	// A bad key file or policy file fails before any database connect.
 	var keys auth.Authenticator
 	if !cfg.dbKeys {
 		if keys, err = loadKeys(cfg.keysPath, log); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
+	}
+	engine, reload, err := loadPolicy(ctx, cfg, reg, log)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	// A nil interface, not a nil *cel.Engine: the gateway checks the
+	// interface for nil.
+	var pol policy.Policy
+	if engine != nil {
+		pol = engine
 	}
 	// One pool serves the keys and the budgets.
 	var pool *pgxpool.Pool
 	closeDB = func() {}
 	if cfg.dbKeys || !cfg.noBudgets {
 		if pool, err = openDB(ctx, cfg.databaseURL); err != nil {
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		closeDB = pool.Close
 	}
 	if cfg.dbKeys {
 		if keys, err = dbKeys(ctx, pool, log); err != nil {
 			closeDB()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 	}
 	// A nil interface, not a nil *postgres.Limiter: the gateway checks the
@@ -303,7 +412,7 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 		})
 		if err := errors.Join(reg.Register(reaped), reg.Register(reapedTokens)); err != nil {
 			closeDB()
-			return nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
 		l := postgres.New(pool,
 			postgres.WithLogger(log),
@@ -321,10 +430,11 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 		Recorder:      audit.NewSlog(log),
 		Registerer:    reg,
 		Limiter:       limiter,
+		Policy:        pol,
 	})
 	if err != nil {
 		closeDB()
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	pm := http.NewServeMux()
@@ -336,7 +446,10 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 
 	mm := http.NewServeMux()
 	mm.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	return pm, mm, closeDB, nil
+	if engine != nil && cfg.policyPoll > 0 {
+		go engine.Watch(ctx, cfg.policyPoll)
+	}
+	return pm, mm, reload, closeDB, nil
 }
 
 // servers returns the HTTP servers for the proxy and metrics handlers.

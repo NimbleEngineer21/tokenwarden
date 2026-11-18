@@ -41,6 +41,9 @@ const (
 	// no budget, or status 200 and an error event when a stream was cut
 	// off because a top-up did not fit.
 	OutcomeBudgetExceeded Outcome = "budget_exceeded"
+	// OutcomePolicyDenied means that the policy denied the request with a
+	// 403 before it went upstream.
+	OutcomePolicyDenied Outcome = "policy_denied"
 )
 
 // Usage holds the token counts that the upstream reported.
@@ -49,6 +52,20 @@ type Usage struct {
 	OutputTokens             int64
 	CacheCreationInputTokens int64
 	CacheReadInputTokens     int64
+}
+
+// Policy is the policy decision on a request. It is empty when the gateway
+// has no policy or the request ended before the decision.
+type Policy struct {
+	// Rule is the name of the rule that decided. It is empty when no rule
+	// matched and the default deny applied.
+	Rule   string
+	Reason string
+	// WouldDeny means that the policy runs in observe mode and would have
+	// denied the request.
+	WouldDeny bool
+	// Revision names the version of the policy file that decided.
+	Revision string
 }
 
 // Event is the audit record of one request.
@@ -73,6 +90,7 @@ type Event struct {
 	// "rate_limit_error".
 	ErrorType string
 	Usage     Usage
+	Policy    Policy
 	Duration  time.Duration
 }
 
@@ -111,6 +129,12 @@ func (s *Slog) Record(ctx context.Context, ev *Event) error {
 			slog.Int64("output_tokens", ev.Usage.OutputTokens),
 			slog.Int64("cache_creation_input_tokens", ev.Usage.CacheCreationInputTokens),
 			slog.Int64("cache_read_input_tokens", ev.Usage.CacheReadInputTokens),
+		),
+		slog.Group("policy",
+			slog.String("rule", ev.Policy.Rule),
+			slog.String("reason", ev.Policy.Reason),
+			slog.Bool("would_deny", ev.Policy.WouldDeny),
+			slog.String("revision", ev.Policy.Revision),
 		),
 		slog.Duration("duration", ev.Duration),
 	)

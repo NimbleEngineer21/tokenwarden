@@ -140,7 +140,7 @@ func TestDecide(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want {
+			if tt.want.Revision = e.Revision(); got != tt.want {
 				t.Fatalf("Decide() = %+v, want %+v", got, tt.want)
 			}
 		})
@@ -153,7 +153,7 @@ func TestDecideNoRulesDenies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (policy.Decision{Reason: cel.ReasonNoRule}); got != want {
+	if want := (policy.Decision{Reason: cel.ReasonNoRule, Revision: e.Revision()}); got != want {
 		t.Fatalf("Decide() = %+v, want %+v", got, want)
 	}
 }
@@ -165,7 +165,7 @@ func TestDecideObserve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (policy.Decision{Allow: true, Rule: "small-requests", Reason: "small"}); got != want {
+	if want := (policy.Decision{Allow: true, Rule: "small-requests", Reason: "small", Revision: e.Revision()}); got != want {
 		t.Fatalf("allowed: Decide() = %+v, want %+v", got, want)
 	}
 	if strings.Contains(logs.String(), "would deny") {
@@ -176,7 +176,7 @@ func TestDecideObserve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := policy.Decision{Allow: true, Rule: "staff-only-opus", Reason: "Opus models are for staff only.", WouldDeny: true}
+	want := policy.Decision{Allow: true, Rule: "staff-only-opus", Reason: "Opus models are for staff only.", WouldDeny: true, Revision: e.Revision()}
 	if got != want {
 		t.Fatalf("denied: Decide() = %+v, want %+v", got, want)
 	}
@@ -190,7 +190,7 @@ func TestDecideObserve(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := (policy.Decision{Allow: true, Reason: cel.ReasonNoRule, WouldDeny: true}); got != want {
+	if want := (policy.Decision{Allow: true, Reason: cel.ReasonNoRule, WouldDeny: true, Revision: e.Revision()}); got != want {
 		t.Fatalf("default deny: Decide() = %+v, want %+v", got, want)
 	}
 }
@@ -235,7 +235,7 @@ func TestDecideEvalError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want {
+			if tt.want.Revision = e.Revision(); got != tt.want {
 				t.Fatalf("Decide() = %+v, want %+v", got, tt.want)
 			}
 		})

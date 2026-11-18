@@ -52,7 +52,8 @@ without it, the gateway needs a Postgres URL in `TW_DATABASE_URL`.
 `docker compose -f deploy/compose.yaml up --build` starts the full stack with
 Postgres, demo keys, and demo budgets. See [docs/tokenwarden.md](docs/tokenwarden.md)
 for the key-file format, how to hash a key, token budgets, the flags, and the
-metric names.
+metric names. [docs/loadgen.md](docs/loadgen.md) shows how to load the
+gateway with concurrent streams and read the report.
 
 ## Development
 

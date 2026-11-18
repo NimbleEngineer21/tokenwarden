@@ -38,7 +38,7 @@ func budgetsSet() command {
 			}
 			return nil
 		},
-		do: func(ctx context.Context, pool *pgxpool.Pool, stdout io.Writer) error {
+		do: func(ctx context.Context, pool *pgxpool.Pool, stdout, _ io.Writer) error {
 			b := limit.Budget{Tokens: tokens, Window: window, MaxInflight: maxInflight.v}
 			if !maxInflight.set {
 				// An omitted flag must not clear a cap. A concurrent change to
@@ -95,7 +95,7 @@ func budgetsList() command {
 	return command{
 		flags: func(*flag.FlagSet) {},
 		check: func() error { return nil },
-		do: func(ctx context.Context, pool *pgxpool.Pool, stdout io.Writer) error {
+		do: func(ctx context.Context, pool *pgxpool.Pool, stdout, _ io.Writer) error {
 			budgets, err := db.New(pool).ListBudgets(ctx)
 			if err != nil {
 				return fmt.Errorf("list budgets: %w", err)
@@ -122,7 +122,7 @@ func budgetsDelete() command {
 			}
 			return nil
 		},
-		do: func(ctx context.Context, pool *pgxpool.Pool, stdout io.Writer) error {
+		do: func(ctx context.Context, pool *pgxpool.Pool, stdout, _ io.Writer) error {
 			n, err := db.New(pool).DeleteBudget(ctx, team)
 			if err != nil {
 				return fmt.Errorf("delete budget: %w", err)

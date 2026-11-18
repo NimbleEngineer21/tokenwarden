@@ -1,5 +1,6 @@
 // Command wardenctl is the admin tool of tokenwarden. It sets and lists the
-// token budgets of teams and shows their token usage.
+// token budgets of teams, shows their token usage, and creates, lists, and
+// revokes gateway keys.
 //
 // The database URL comes from the environment variable TW_DATABASE_URL,
 // never from a flag, so that the password does not show in the process list
@@ -37,6 +38,9 @@ const usageText = `Usage:
   wardenctl budgets list
   wardenctl budgets delete -team TEAM
   wardenctl usage [-team TEAM] [-since DURATION]
+  wardenctl keys create -team TEAM [-user USER]
+  wardenctl keys list [-team TEAM] [-all]
+  wardenctl keys revoke -id KEYID
 
 The database URL comes from TW_DATABASE_URL. See docs/wardenctl.md.
 `
@@ -59,7 +63,7 @@ func main() {
 type command struct {
 	flags func(fs *flag.FlagSet)
 	check func() error
-	do    func(ctx context.Context, pool *pgxpool.Pool, stdout io.Writer) error
+	do    func(ctx context.Context, pool *pgxpool.Pool, stdout, stderr io.Writer) error
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stdout, stderr io.Writer) error {
@@ -99,7 +103,7 @@ func run(ctx context.Context, args []string, getenv func(string) string, stdout,
 		return err
 	}
 	defer pool.Close()
-	return cmd.do(ctx, pool, stdout)
+	return cmd.do(ctx, pool, stdout, stderr)
 }
 
 // lookup finds the subcommand that args name and returns its full name and
@@ -121,6 +125,9 @@ func commands() map[string]command {
 		"budgets list":   budgetsList(),
 		"budgets delete": budgetsDelete(),
 		"usage":          usage(),
+		"keys create":    keysCreate(),
+		"keys list":      keysList(),
+		"keys revoke":    keysRevoke(),
 	}
 }
 

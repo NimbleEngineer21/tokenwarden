@@ -1,8 +1,9 @@
 # wardenctl
 
 `cmd/wardenctl` is the admin tool of tokenwarden. It sets and lists the
-token budgets of teams and shows their token usage. It works on the same
-Postgres database as the gateway.
+token budgets of teams, shows their token usage, and creates, lists, and
+revokes gateway keys. It works on the same Postgres database as the
+gateway. The key commands apply to a gateway that runs with `-db-keys`.
 
 ## Database
 
@@ -97,3 +98,64 @@ red   2026-11-17T15:00:00Z  1h      38210    1024      1000000  2
 |---|---|---|
 | `-team` | none | Show only this team. |
 | `-since` | `24h` | Show windows that ended less than this long ago. |
+
+### `wardenctl keys create`
+
+Creates a gateway key for a team. The key is `tw_` and 43 base64url
+characters (256 random bits). The database holds only its SHA-256 hash.
+
+```sh
+key=$(wardenctl keys create -team red -user alice)
+```
+
+stdout gets the key and nothing else, so that a script can capture it.
+stderr gets the key ID and a note that the key is not shown again. Store
+the key at once: wardenctl cannot show it again.
+
+The key works on the next request, on every replica. A key of a team
+without a budget is valid, but its requests get 403 `permission_error`
+until the team has a budget; wardenctl prints a warning to stderr.
+
+The key ID is the first 12 hex characters of the hash. wardenctl never
+makes two keys with the same key ID, revoked keys included, so a key ID
+names one key.
+
+| Flag | Default | Value |
+|---|---|---|
+| `-team` | none | Team that owns the key. Required. |
+| `-user` | none | Person or service that holds the key. It shows in the audit log. |
+
+### `wardenctl keys list`
+
+Lists the gateway keys by key ID. It never shows a key or its full hash.
+
+```text
+KEY ID        TEAM  USER   CREATED               REVOKED
+034a44af6ff9  red   alice  2026-11-17T15:00:00Z  -
+```
+
+`USER` is `-` when the key has no user. `REVOKED` is the revoke time, or
+`-` for an active key.
+
+| Flag | Default | Value |
+|---|---|---|
+| `-team` | none | Show only this team. |
+| `-all` | `false` | Also show revoked keys. |
+
+### `wardenctl keys revoke`
+
+Revokes a key. The gateway does not cache keys: the next request with the
+key gets 401, on every replica. Open requests of the key finish. The row
+stays, so that audit lines with the key ID still name a team and a user.
+
+```sh
+wardenctl keys revoke -id 034a44af6ff9
+```
+
+It is an error when no active key has the key ID. When more than one active
+key has it (only possible for keys added without wardenctl), wardenctl
+revokes none of them and prints the count.
+
+| Flag | Default | Value |
+|---|---|---|
+| `-id` | none | Key ID from `keys list`: 12 lowercase hex characters. Required. |

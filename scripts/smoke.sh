@@ -2,9 +2,10 @@
 # Smoke test for deploy/compose.yaml: start the stack, check that an unknown
 # key gets 401, send one stream and one non-stream request through each
 # gateway replica, check the audit lines and the metrics, list the budgets
-# with wardenctl, run team blue past its token budget, check that the
-# internal ports are not published, then stop the stack. Needs Docker with
-# Compose v2 and curl. Run it from the repo root.
+# with wardenctl, run team blue past its token budget, create and revoke a
+# key with wardenctl, check that the internal ports are not published, then
+# stop the stack. Needs Docker with Compose v2 and curl. Run it from the
+# repo root.
 set -eu
 
 compose() { docker compose -f deploy/compose.yaml "$@"; }
@@ -195,6 +196,30 @@ if echo "$reply" | grep -q '^event: message_stop'; then
 fi
 wait_audit gateway-a '"team":"blue"' '"stream":true,' '"outcome":"budget_exceeded"'
 echo "smoke: a stream past the budget is cut with a rate_limit_error event"
+
+# A key that wardenctl creates works at once on both replicas, and gets 401
+# on both after wardenctl revokes it. -T: a TTY would add \r to the key.
+ctl() { compose --profile tools run --rm -q -T wardenctl "$@"; }
+new_key=$(ctl keys create -team red -user smoke 2>/dev/null) ||
+	fail "wardenctl keys create failed"
+for r in $replicas; do
+	port=${r%%:*}
+	request "$port" "$new_key" false 32 -f -o /dev/null ||
+		fail "127.0.0.1:$port: the new key did not work"
+done
+new_id=$(ctl keys list -team red | awk '$3 == "smoke" { print $1 }')
+[ -n "$new_id" ] || fail "wardenctl keys list does not list the new key"
+ctl keys revoke -id "$new_id" >/dev/null || fail "wardenctl keys revoke failed"
+for r in $replicas; do
+	port=${r%%:*}
+	code=$(request "$port" "$new_key" false 32 -o /dev/null -w '%{http_code}') ||
+		fail "127.0.0.1:$port: the revoked-key request failed"
+	[ "$code" = 401 ] || fail "127.0.0.1:$port: a revoked key got $code, want 401"
+done
+if compose logs --no-color | grep -qF -- "$new_key"; then
+	fail "the new key is in the logs"
+fi
+echo "smoke: wardenctl creates a key that works and revokes it"
 
 # Only the proxy ports may be published, and only on 127.0.0.1. Ask Compose,
 # not the host: another local process can hold 9090 or 8081. `compose port`

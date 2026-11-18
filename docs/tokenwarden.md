@@ -202,7 +202,16 @@ Each request reads its key with one primary-key query, with no cache. So a
 new key works, and a revoked key fails, from the next request on. A
 database failure gives 500 `api_error`, never access.
 
-Add a key with its hash ([Make and hash a key](#make-and-hash-a-key)):
+Make, list, and revoke keys with [wardenctl](wardenctl.md#wardenctl-keys-create):
+
+```sh
+key=$(wardenctl keys create -team red -user alice)
+wardenctl keys list -team red
+wardenctl keys revoke -id 034a44af6ff9
+```
+
+Without wardenctl, use SQL. Add a key with its hash
+([Make and hash a key](#make-and-hash-a-key)):
 
 ```sql
 INSERT INTO gateway_keys (sha256, team, user_name)

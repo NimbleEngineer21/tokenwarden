@@ -27,7 +27,8 @@ const keyPrefix = "tw_"
 const keyBytes = 32
 
 // createTries bounds the attempts to find a key whose key ID no other row
-// has. With 48-bit key IDs, a second attempt is already very improbable.
+// has (the unique index gateway_keys_key_id). With 48-bit key IDs, a second
+// attempt is already very improbable.
 const createTries = 3
 
 // keyIDPattern is the form of a key ID from [auth.KeyID]. A test keeps the
@@ -72,7 +73,7 @@ func keysCreate() command {
 				// The key goes to stdout alone, so that a script can capture
 				// it; everything else goes to stderr.
 				if _, err := fmt.Fprintln(stdout, key); err != nil {
-					return err
+					return revokeUnseen(ctx, q, auth.KeyID(hash), err)
 				}
 				fmt.Fprintf(stderr, "key ID %s, team %s: store the key now; it is not shown again\n", auth.KeyID(hash), team)
 				warnNoBudget(ctx, q, team, stderr)
@@ -83,11 +84,32 @@ func keysCreate() command {
 	}
 }
 
+// revokeTimeout bounds the revoke of a key that could not be shown.
+const revokeTimeout = 5 * time.Second
+
+// revokeUnseen revokes a new key whose write to stdout failed: nobody holds
+// it, so it must not stay active. It runs even when ctx is canceled, so that
+// an interrupt does not leave the key active.
+func revokeUnseen(ctx context.Context, q *db.Queries, id string, writeErr error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), revokeTimeout)
+	defer cancel()
+	if _, err := q.RevokeKey(ctx, id); err != nil {
+		return fmt.Errorf("write key: %w; revoke the unseen key %s: %w", writeErr, id, err)
+	}
+	return fmt.Errorf("write key: %w; the key %s is revoked", writeErr, id)
+}
+
+// budgetReader reads the budget of a team. *db.Queries implements it; a
+// test fakes a failed read.
+type budgetReader interface {
+	GetBudget(ctx context.Context, team string) (db.GetBudgetRow, error)
+}
+
 // warnNoBudget tells the admin that the key of a team without a budget gets
 // 403 until the team has one. The key is valid and already printed, so a
 // failed check is a note, not an error: an error exit would make a script
 // drop a key that works.
-func warnNoBudget(ctx context.Context, q *db.Queries, team string, stderr io.Writer) {
+func warnNoBudget(ctx context.Context, q budgetReader, team string, stderr io.Writer) {
 	_, err := q.GetBudget(ctx, team)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -150,20 +172,15 @@ func keysRevoke() command {
 			return nil
 		},
 		do: func(ctx context.Context, pool *pgxpool.Pool, stdout, _ io.Writer) error {
-			return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
-				rows, err := db.New(tx).RevokeKey(ctx, id)
-				switch {
-				case err != nil:
-					return fmt.Errorf("revoke key: %w", err)
-				case len(rows) == 0:
-					return fmt.Errorf("no active key has the key ID %s", id)
-				case len(rows) > 1:
-					// An error rolls back the transaction: no key is revoked.
-					return fmt.Errorf("%d active keys have the key ID %s; none revoked", len(rows), id)
-				}
-				_, err = fmt.Fprintf(stdout, "key %s of team %s revoked; its requests now get 401\n", id, rows[0].Team)
-				return err
-			})
+			team, err := db.New(pool).RevokeKey(ctx, id)
+			switch {
+			case errors.Is(err, pgx.ErrNoRows):
+				return fmt.Errorf("no active key has the key ID %s", id)
+			case err != nil:
+				return fmt.Errorf("revoke key: %w", err)
+			}
+			_, err = fmt.Fprintf(stdout, "key %s of team %s revoked; its requests now get 401\n", id, team)
+			return err
 		},
 	}
 }

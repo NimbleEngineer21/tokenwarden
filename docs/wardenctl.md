@@ -116,9 +116,12 @@ The key works on the next request, on every replica. A key of a team
 without a budget is valid, but its requests get 403 `permission_error`
 until the team has a budget; wardenctl prints a warning to stderr.
 
-The key ID is the first 12 hex characters of the hash. wardenctl never
-makes two keys with the same key ID, revoked keys included, so a key ID
-names one key.
+The key ID is the first 12 hex characters of the hash. The database
+refuses two keys with the same key ID, revoked keys included, so a key ID
+names one key. On such a clash, wardenctl makes a new key, up to 3 times.
+
+If wardenctl cannot write the key to stdout, it revokes the key, because
+nobody has it, and exits 1.
 
 | Flag | Default | Value |
 |---|---|---|
@@ -152,9 +155,7 @@ stays, so that audit lines with the key ID still name a team and a user.
 wardenctl keys revoke -id 034a44af6ff9
 ```
 
-It is an error when no active key has the key ID. When more than one active
-key has it (only possible for keys added without wardenctl), wardenctl
-revokes none of them and prints the count.
+It is an error when no active key has the key ID.
 
 | Flag | Default | Value |
 |---|---|---|

@@ -26,10 +26,8 @@ func (q *Queries) DeleteBudget(ctx context.Context, team string) (int64, error) 
 
 const insertKey = `-- name: InsertKey :execrows
 INSERT INTO gateway_keys (sha256, team, user_name)
-SELECT $1::text, $2::text, $3::text
-WHERE NOT EXISTS (
-    SELECT 1 FROM gateway_keys k WHERE left(k.sha256, 12) = left($1::text, 12)
-)
+VALUES ($1::text, $2::text, $3::text)
+ON CONFLICT ((left(sha256, 12))) DO NOTHING
 `
 
 type InsertKeyParams struct {
@@ -38,9 +36,9 @@ type InsertKeyParams struct {
 	UserName string
 }
 
-// InsertKey adds a gateway key unless a row, revoked or not, has the same
-// key ID (the first 12 hex characters of the hash), so that a key ID names
-// one key. It changes no row on such a clash.
+// InsertKey adds a gateway key. It changes no row when a row, revoked or
+// not, has the same key ID; the unique index gateway_keys_key_id decides,
+// so two concurrent inserts cannot both win.
 func (q *Queries) InsertKey(ctx context.Context, arg InsertKeyParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertKey, arg.Sha256, arg.Team, arg.UserName)
 	if err != nil {
@@ -201,35 +199,17 @@ func (q *Queries) ListUsage(ctx context.Context, arg ListUsageParams) ([]ListUsa
 	return items, nil
 }
 
-const revokeKey = `-- name: RevokeKey :many
+const revokeKey = `-- name: RevokeKey :one
 UPDATE gateway_keys SET revoked_at = now()
 WHERE left(sha256, 12) = $1::text AND revoked_at IS NULL
-RETURNING team, user_name
+RETURNING team
 `
 
-type RevokeKeyRow struct {
-	Team     string
-	UserName string
-}
-
-// RevokeKey revokes the active keys with this key ID and returns them. The
-// caller rolls back when more than one row comes back.
-func (q *Queries) RevokeKey(ctx context.Context, keyID string) ([]RevokeKeyRow, error) {
-	rows, err := q.db.Query(ctx, revokeKey, keyID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var items []RevokeKeyRow
-	for rows.Next() {
-		var i RevokeKeyRow
-		if err := rows.Scan(&i.Team, &i.UserName); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
+// RevokeKey revokes the active key with this key ID and returns its team.
+// The unique index allows at most one such key.
+func (q *Queries) RevokeKey(ctx context.Context, keyID string) (string, error) {
+	row := q.db.QueryRow(ctx, revokeKey, keyID)
+	var team string
+	err := row.Scan(&team)
+	return team, err
 }

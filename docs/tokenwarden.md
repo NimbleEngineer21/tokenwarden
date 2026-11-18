@@ -198,6 +198,10 @@ holds the hash of each key, never the key:
 | `created_at` | When the row was added. |
 | `revoked_at` | When the key was revoked, or null. |
 
+The key ID, the first 12 hex characters of `sha256`, is unique, revoked
+keys included: an insert of a second key with the same key ID fails. An
+audit line with a `key_id` names one key.
+
 Each request reads its key with one primary-key query, with no cache. So a
 new key works, and a revoked key fails, from the next request on. A
 database failure gives 500 `api_error`, never access.

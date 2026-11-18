@@ -2,16 +2,20 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"errors"
+	"io"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/NimbleEngineer21/tokenwarden/auth"
 	authpg "github.com/NimbleEngineer21/tokenwarden/auth/postgres"
+	"github.com/NimbleEngineer21/tokenwarden/internal/store/db"
 )
 
 // defaultNewKey is the real key generator, which TestKeysCreateClash puts
@@ -98,8 +102,12 @@ func TestKeys(t *testing.T) {
 	if len(rows) != 3 || strings.Join(rows[0], " ") != "KEY ID TEAM USER CREATED REVOKED" {
 		t.Fatalf("keys list = %v", rows)
 	}
-	if green := rows[1]; green[1] != "green" || green[2] != "-" || green[4] != "-" {
+	green := rows[1]
+	if green[1] != "green" || green[2] != "-" || green[4] != "-" {
 		t.Errorf("green row = %v, want user - and revoked -", green)
+	}
+	if got := ctl(t, dbURL, "keys", "revoke", "-id", green[0]); got != "key "+green[0]+" of team green revoked; its requests now get 401\n" {
+		t.Errorf("keys revoke of the green key = %q", got)
 	}
 	if red := rows[2]; red[0] != id || red[1] != "red" || red[2] != "alice" {
 		t.Errorf("red row = %v, want key ID %s, red, alice", red, id)
@@ -126,19 +134,48 @@ func TestKeys(t *testing.T) {
 	}
 }
 
-func TestKeysRevokeClash(t *testing.T) {
-	dbURL, pool := database(t)
-	authn := authpg.New(pool)
-	const id = "0123456789ab"
-	insertKeyRow(t, pool, id+strings.Repeat("0", 52), "red")
-	insertKeyRow(t, pool, id+strings.Repeat("1", 52), "blue")
+// failWriter fails every write, as a full disk does.
+type failWriter struct{}
 
-	_, _, err := ctlErr(t, dbURL, "keys", "revoke", "-id", id)
-	if err == nil || !strings.Contains(err.Error(), "2 active keys") || !strings.Contains(err.Error(), "none revoked") {
-		t.Fatalf("revoke of a shared key ID: err = %v", err)
+func (failWriter) Write([]byte) (int, error) { return 0, errors.New("disk full") }
+
+func TestKeysCreateRevokesUnseenKey(t *testing.T) {
+	dbURL, pool := database(t)
+	err := run(t.Context(), []string{"keys", "create", "-team", "red"}, env(dbURL), failWriter{}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "disk full") || !strings.Contains(err.Error(), "is revoked") {
+		t.Fatalf("keys create with a failed stdout: err = %v", err)
 	}
-	if n, err := authn.Count(t.Context()); err != nil || n != 2 {
-		t.Errorf("active keys after a refused revoke = %d, %v; want 2", n, err)
+	if n, err := authpg.New(pool).Count(t.Context()); err != nil || n != 0 {
+		t.Errorf("active keys = %d, %v; want 0", n, err)
+	}
+	if rows := fields(ctl(t, dbURL, "keys", "list", "-all")); len(rows) != 2 || rows[1][4] == "-" {
+		t.Errorf("keys list -all = %v, want one revoked key", rows)
+	}
+}
+
+// budgetFunc is a budgetReader from a function.
+type budgetFunc func() (db.GetBudgetRow, error)
+
+func (f budgetFunc) GetBudget(context.Context, string) (db.GetBudgetRow, error) { return f() }
+
+func TestWarnNoBudget(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"budget", nil, ""},
+		{"no budget", pgx.ErrNoRows, "warning: team red has no budget"},
+		{"read fails", errors.New("connection reset"), "warning: could not check the budget of team red: connection reset"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var stderr bytes.Buffer
+			warnNoBudget(t.Context(), budgetFunc(func() (db.GetBudgetRow, error) { return db.GetBudgetRow{}, tt.err }), "red", &stderr)
+			if tt.want == "" && stderr.Len() > 0 || !strings.Contains(stderr.String(), tt.want) {
+				t.Errorf("stderr = %q, want %q", stderr.String(), tt.want)
+			}
+		})
 	}
 }
 

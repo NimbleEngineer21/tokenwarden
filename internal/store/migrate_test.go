@@ -113,3 +113,39 @@ func TestCheckVersion(t *testing.T) {
 		})
 	}
 }
+
+// TestKeyIDIsUnique checks migration 0005: two keys cannot share a key ID,
+// and a database that already has such keys gets a message that names the
+// key ID, not a bare index error.
+func TestKeyIDIsUnique(t *testing.T) {
+	pool := pgtest.New(t)
+	ctx := t.Context()
+	if err := store.Migrate(ctx, pool); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	const id = "0123456789ab"
+	insert := "INSERT INTO gateway_keys (sha256, team) VALUES ($1, 'red')"
+	if _, err := pool.Exec(ctx, insert, id+strings.Repeat("0", 52)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, insert, id+strings.Repeat("1", 52)); err == nil {
+		t.Fatal("a second key with the same key ID was accepted")
+	}
+
+	// Go back to before 0005, add the clash, and migrate again.
+	for _, q := range []string{
+		"DROP INDEX gateway_keys_key_id",
+		"DELETE FROM schema_migrations WHERE version = 5",
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := pool.Exec(ctx, insert, id+strings.Repeat("1", 52)); err != nil {
+		t.Fatal(err)
+	}
+	err := store.Migrate(ctx, pool)
+	if err == nil || !strings.Contains(err.Error(), "more than one key has the key ID "+id) {
+		t.Fatalf("Migrate with a key ID clash: err = %v", err)
+	}
+}

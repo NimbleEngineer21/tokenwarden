@@ -1,5 +1,6 @@
 # Two gateway replicas, the mock upstream, and Postgres for the shared
-# gateway keys and token budgets. See docs/tokenwarden.md.
+# gateway keys and token budgets. The gateways apply deploy/policy.yaml. See
+# docs/tokenwarden.md.
 #
 #   docker compose -f deploy/compose.yaml up --build
 #
@@ -21,7 +22,9 @@ x-gateway: &gateway
     context: ..
     target: tokenwarden
   image: tokenwarden:local
-  command: ["-db-keys"]
+  command: ["-db-keys", "-policy", "/etc/tokenwarden/policy.yaml"]
+  volumes:
+    - ./policy.yaml:/etc/tokenwarden/policy.yaml:ro
   read_only: true
   cap_drop: [ALL]
   security_opt: ["no-new-privileges:true"]

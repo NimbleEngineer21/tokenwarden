@@ -25,6 +25,7 @@ import (
 	"github.com/NimbleEngineer21/tokenwarden/auth"
 	"github.com/NimbleEngineer21/tokenwarden/internal/anthropic"
 	"github.com/NimbleEngineer21/tokenwarden/limit"
+	"github.com/NimbleEngineer21/tokenwarden/policy"
 )
 
 // maxRequestBytes is the request size limit of the Messages API.
@@ -70,6 +71,10 @@ type Config struct {
 	// Estimator guesses the tokens to hold before the upstream reports
 	// them. Nil uses [limit.ByteEstimator]. It is used only with a Limiter.
 	Estimator limit.Estimator
+	// Policy decides whether an authenticated request may go upstream. The
+	// gateway asks it before it holds any budget, and answers a deny with
+	// 403 permission_error. Nil allows every authenticated request.
+	Policy policy.Policy
 }
 
 // gateway is the handler that [New] returns.
@@ -83,6 +88,7 @@ type gateway struct {
 	metrics  *metrics
 	limiter  limit.Limiter
 	est      limit.Estimator
+	policy   policy.Policy
 	mux      *http.ServeMux
 }
 
@@ -129,6 +135,7 @@ func New(cfg Config) (http.Handler, error) {
 		metrics:  m,
 		limiter:  cfg.Limiter,
 		est:      cfg.Estimator,
+		policy:   cfg.Policy,
 		mux:      http.NewServeMux(),
 	}
 	if g.log == nil {
@@ -204,6 +211,10 @@ func (g *gateway) handleMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	ev.Model, ev.Stream = p.Model, p.Stream
 	log = log.With("model", p.Model, "stream", p.Stream)
+
+	if g.policy != nil && !g.decide(ctx, w, ev, body, log) {
+		return
+	}
 
 	var b *budget
 	if g.limiter != nil {

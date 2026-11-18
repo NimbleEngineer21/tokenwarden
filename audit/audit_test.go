@@ -24,6 +24,7 @@ func TestSlogRecord(t *testing.T) {
 		Status:            200,
 		Outcome:           OutcomeOK,
 		Usage:             Usage{InputTokens: 3, OutputTokens: 7, CacheCreationInputTokens: 1, CacheReadInputTokens: 2},
+		Policy:            Policy{Rule: "everyone", Reason: "ok for all", WouldDeny: true, Revision: "abc123"},
 		Duration:          1500 * time.Millisecond,
 	}
 	if err := r.Record(t.Context(), ev); err != nil {
@@ -34,7 +35,7 @@ func TestSlogRecord(t *testing.T) {
 		t.Fatalf("log line %q: %v", buf.String(), err)
 	}
 	wantKeys := []string{
-		"duration", "error_type", "event_time", "key_id", "level", "model", "msg", "outcome",
+		"duration", "error_type", "event_time", "key_id", "level", "model", "msg", "outcome", "policy",
 		"request_id", "status", "stream", "team", "time", "upstream_request_id", "usage", "user",
 	}
 	keys := make([]string, 0, len(got))
@@ -68,6 +69,17 @@ func TestSlogRecord(t *testing.T) {
 		if u[k] != want {
 			t.Errorf("usage.%s = %v, want %v", k, u[k], want)
 		}
+	}
+	p, _ := got["policy"].(map[string]any)
+	for k, want := range map[string]any{
+		"rule": "everyone", "reason": "ok for all", "would_deny": true, "revision": "abc123",
+	} {
+		if p[k] != want {
+			t.Errorf("policy.%s = %v, want %v", k, p[k], want)
+		}
+	}
+	if len(p) != 4 {
+		t.Errorf("policy = %v, want 4 keys", p)
 	}
 }
 

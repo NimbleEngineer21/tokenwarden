@@ -2,8 +2,8 @@
 
 `cmd/tokenwarden` is the reference gateway. It proxies `POST /v1/messages`
 to an Anthropic Messages API upstream. It replaces each client's gateway key
-with the upstream key, enforces each team's token budget, and writes one
-audit log line per request.
+with the upstream key, asks a [policy](#policy) about each request, enforces
+each team's token budget, and writes one audit log line per request.
 
 ## Quick start with the mock upstream
 
@@ -17,12 +17,13 @@ audit log line per request.
    [Key file](#key-file)). Save it as `keys.json`.
 3. Start the gateway. `-no-budgets` turns the token budgets off, so that
    no database is necessary. To use budgets, see [Token budgets](#token-budgets)
-   or [Run with Docker Compose](#run-with-docker-compose).
+   or [Run with Docker Compose](#run-with-docker-compose). `-no-policy`
+   allows every request with a valid key; see [Policy](#policy).
 
    ```sh
    TW_UPSTREAM_URL=http://127.0.0.1:8081 \
    TW_UPSTREAM_KEY=sk-ant-test-mock \
-   go run ./cmd/tokenwarden -keys keys.json -no-budgets
+   go run ./cmd/tokenwarden -keys keys.json -no-budgets -no-policy
    ```
 
 4. Send a request:
@@ -60,6 +61,11 @@ The `seed` service waits until a gateway creates the schema, and then runs
 `deploy/keys.sql` and `deploy/budgets.sql` in one transaction. It does not
 change a key or a budget that is already set.
 
+The gateways use the demo policy `deploy/policy.yaml`: team `blue` gets 403
+for a model whose name starts with `claude-opus`, and every other request is
+allowed. To reload it after an edit, send SIGHUP:
+`docker compose -f deploy/compose.yaml kill -s HUP gateway-a gateway-b`.
+
 | Team | Budget |
 |---|---|
 | `red` | 1,000,000 tokens per hour |
@@ -96,8 +102,8 @@ real API. When `ANTHROPIC_API_KEY` is empty, the real gateways do not start.
 
 `make smoke` starts the stack, sends a stream and a non-stream request
 through each mock replica, checks the audit lines, the metrics, and the
-published ports, runs team `blue` past its budget, and then stops the
-stack. The `smoke` workflow runs it on
+published ports, checks a policy deny and a SIGHUP reload, runs team `blue`
+past its budget, and then stops the stack. The `smoke` workflow runs it on
 each pull request.
 
 ## Configuration
@@ -120,12 +126,20 @@ in shell history. The gateway does not start when `TW_UPSTREAM_URL` or
 | `-keys` | none | Path of the [key file](#key-file). Give this flag or `-db-keys`, not both. |
 | `-db-keys` | off | Read the keys from the database of `TW_DATABASE_URL` ([Keys in Postgres](#keys-in-postgres)). |
 | `-no-budgets` | off | Enforce no token budgets. Without `-db-keys`, the gateway does not start when this flag and `TW_DATABASE_URL` are both set, or when neither is set. With `-db-keys`, the database holds only the keys. |
+| `-policy` | none | Path of the [policy file](#policy). Give this flag or `-no-policy`, not both. |
+| `-no-policy` | off | Allow every request that has a valid key. |
+| `-policy-poll` | `10s` | How often the gateway reads the policy file to find changes. `0` reads it only on SIGHUP. Needs `-policy`. |
 
 The gateway does not start when:
 
 - The key file is missing, is not valid, or holds no keys.
+- Neither `-policy` nor `-no-policy` is set, or the policy file is missing
+  or not valid.
 - The database is not available within 30 seconds, or a newer release of
   the gateway migrated it.
+
+On SIGHUP, the gateway reloads the policy file. With `-no-policy`, it logs
+the signal and does nothing else. SIGHUP never stops the gateway.
 
 On SIGINT or SIGTERM, the gateway stops accepting connections and lets open
 requests run for 10 seconds. Then it cuts the streams that are still open,
@@ -299,6 +313,44 @@ lease length.
 The gateway deletes the usage counts of a window 7 days after the window
 ends.
 
+## Policy
+
+`-policy` names a YAML file of rules written in [CEL](https://cel.dev). The
+gateway asks the policy about each request after it checks the key and
+before it holds any budget. The policy is default deny: a request that no
+rule allows is denied. The rules see the team, the user, the model,
+`max_tokens`, and the names of the tool definitions (MCP tools included).
+The file format and the rule order are in the
+[`policy/cel` package documentation](https://pkg.go.dev/github.com/NimbleEngineer21/tokenwarden/policy/cel).
+
+```yaml
+version: 1
+mode: enforce # or observe
+rules:
+  - name: blue-no-opus
+    match: {teams: [blue]}
+    expr: request.model.startsWith("claude-opus")
+    effect: deny
+    reason: Opus models are for staff only.
+  - name: everyone
+    effect: allow
+```
+
+- A denied request gets 403 with the error type `permission_error`. The
+  message is the `reason` of the rule. The reply does not name the rule.
+- A request whose `max_tokens` is not an integer, or whose `tools` is not a
+  list of objects with a string `name`, gets 400 `invalid_request_error`.
+- In `observe` mode, the gateway allows every request and logs each request
+  that the rules would deny.
+- If the policy cannot decide, the request gets 500 `api_error`.
+
+The gateway reads the file again every `-policy-poll` and on SIGHUP. It
+compares the content, so a Kubernetes ConfigMap update is seen too. When the
+new file is missing or not valid, the gateway logs an error, counts it in
+`tokenwarden_policy_reloads_total`, and keeps the rules that it has. Each
+audit line holds the rule that decided and the revision (SHA-256) of the
+file.
+
 ## Endpoints
 
 | Listener | Path | Purpose |
@@ -317,12 +369,15 @@ interface.
 
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
-| `tokenwarden_requests_total` | counter | `outcome`, `stream` | Messages API requests. `outcome` is one of `ok`, `unauthorized`, `invalid`, `upstream_error`, `gateway_error`, `incomplete`, `canceled`, `budget_exceeded`. |
+| `tokenwarden_requests_total` | counter | `outcome`, `stream` | Messages API requests. `outcome` is one of `ok`, `unauthorized`, `invalid`, `upstream_error`, `gateway_error`, `incomplete`, `canceled`, `budget_exceeded`, `policy_denied`. |
 | `tokenwarden_request_duration_seconds` | histogram | `stream` | Time from the request to the end of the reply. |
 | `tokenwarden_streams_active` | gauge | none | Streams that the gateway relays now. |
 | `tokenwarden_tokens_total` | counter | `team`, `kind` | Tokens that the upstream reported. `kind` is one of `input`, `output`, `cache_creation`, `cache_read`. |
 | `tokenwarden_budget_denials_total` | counter | `team`, `stage` | Requests that the token budget stopped. `stage` is `reserve` (429 or 403 before the upstream call), `concurrency` (429 at the in-flight limit), or `topup` (a stream cut). |
 | `tokenwarden_topups_total` | counter | `result` | Stream holds after the first one. `result` is one of `ok`, `exceeded`, `error`. |
+| `tokenwarden_policy_decisions_total` | counter | `result`, `rule` | Policy decisions. `result` is one of `allow`, `deny`, `would_deny` (observe mode), `error`. `rule` is the rule that decided; it is empty for the default deny and for `error`. Only with `-policy`. |
+| `tokenwarden_policy_reloads_total` | counter | `result` | Loads of the policy file, the first load included. `result` is `ok`, or `error` when the gateway kept its rules. Only with `-policy`. |
+| `tokenwarden_policy_last_reload_success_timestamp_seconds` | gauge | none | Unix time of the last load of the policy file that worked. Only with `-policy`. |
 | `tokenwarden_reaped_reservations_total` | counter | none | Holds that the gateway reaped after their lease ended. Only with budgets on. |
 | `tokenwarden_reaped_tokens_total` | counter | none | Tokens that the reaped holds held. They count as used. Only with budgets on. |
 
@@ -330,6 +385,8 @@ interface.
 
 The gateway writes JSON logs to stderr. Each request to `/v1/messages` gives
 one line with `"msg":"audit"`. The line holds the request IDs, `key_id`,
-team, user, model, status, outcome, token usage, and duration. `time` is when
+team, user, model, status, outcome, token usage, the policy decision
+(`policy.rule`, `policy.reason`, `policy.would_deny`, `policy.revision`), and
+duration. `time` is when
 the gateway wrote the line. `event_time` is when the request started. The
 gateway never logs a key, an `Authorization` value, or prompt or reply text.

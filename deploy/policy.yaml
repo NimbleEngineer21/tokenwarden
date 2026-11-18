@@ -1,0 +1,13 @@
+# Demo policy for deploy/compose.yaml. See docs/tokenwarden.md#policy.
+# Edit it, then reload it with:
+#   docker compose -f deploy/compose.yaml kill -s HUP gateway-a gateway-b
+version: 1
+mode: enforce
+rules:
+  - name: blue-no-opus
+    match: {teams: [blue]}
+    expr: request.model.startsWith("claude-opus")
+    effect: deny
+    reason: Opus models are for staff only.
+  - name: everyone
+    effect: allow

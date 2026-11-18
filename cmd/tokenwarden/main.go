@@ -79,6 +79,8 @@ type config struct {
 	databaseURL string
 	noBudgets   bool
 	dbKeys      bool
+	// ledgerRetention is how long the usage ledger keeps an hour's rows.
+	ledgerRetention time.Duration
 }
 
 func run(ctx context.Context, args []string, getenv func(string) string, stderr io.Writer) error {
@@ -118,6 +120,7 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	fs.StringVar(&cfg.keysPath, "keys", "", "JSON key file of SHA-256 gateway key hashes; give this or -db-keys")
 	fs.BoolVar(&cfg.dbKeys, "db-keys", false, "read gateway keys from the database of TW_DATABASE_URL; give this or -keys")
 	fs.BoolVar(&cfg.noBudgets, "no-budgets", false, "enforce no token budgets; required when TW_DATABASE_URL is not set")
+	fs.DurationVar(&cfg.ledgerRetention, "ledger-retention", postgres.DefaultLedgerRetention, "how long to keep usage ledger rows")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return config{}, err
@@ -133,6 +136,8 @@ func parseConfig(args []string, getenv func(string) string, stderr io.Writer) (c
 	cfg.upstreamKey = getenv("TW_UPSTREAM_KEY")
 	cfg.databaseURL = getenv("TW_DATABASE_URL")
 	switch {
+	case cfg.ledgerRetention <= 0:
+		return config{}, errors.New("-ledger-retention must be positive")
 	case cfg.upstreamURL == "":
 		return config{}, errors.New("TW_UPSTREAM_URL is not set")
 	case cfg.upstreamKey == "":
@@ -307,6 +312,7 @@ func handlers(ctx context.Context, cfg config, log *slog.Logger) (proxy, metrics
 		}
 		l := postgres.New(pool,
 			postgres.WithLogger(log),
+			postgres.WithLedgerRetention(cfg.ledgerRetention),
 			postgres.WithReapFunc(func(n int, tokens int64) {
 				reaped.Add(float64(n))
 				reapedTokens.Add(float64(tokens))

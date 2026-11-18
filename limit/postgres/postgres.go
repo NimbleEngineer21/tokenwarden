@@ -24,8 +24,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -51,8 +53,10 @@ type Limiter struct {
 	now       func() time.Time
 	ttl       time.Duration
 	retention time.Duration
-	onReap    func(reservations int, tokens int64)
-	log       *slog.Logger
+	// ledgerRetention is how long Run keeps usage ledger rows.
+	ledgerRetention time.Duration
+	onReap          func(reservations int, tokens int64)
+	log             *slog.Logger
 
 	// open holds the ids of this limiter's open reservations, whose leases
 	// Run renews.
@@ -64,6 +68,8 @@ type Limiter struct {
 const (
 	DefaultLeaseTTL  = 30 * time.Second
 	DefaultRetention = 7 * 24 * time.Hour
+	// DefaultLedgerRetention is how long Run keeps usage ledger rows.
+	DefaultLedgerRetention = 90 * 24 * time.Hour
 )
 
 // Option configures a [Limiter].
@@ -102,6 +108,17 @@ func WithRetention(d time.Duration) Option {
 	}
 }
 
+// WithLedgerRetention sets how long Run keeps the usage ledger rows of an
+// hour after the hour starts. A negative value keeps
+// [DefaultLedgerRetention].
+func WithLedgerRetention(d time.Duration) Option {
+	return func(l *Limiter) {
+		if d >= 0 {
+			l.ledgerRetention = d
+		}
+	}
+}
+
 // WithReapFunc makes Run call f after it reaps reservations, with how many
 // it reaped and the tokens that they held. A nil f calls nothing.
 func WithReapFunc(f func(reservations int, tokens int64)) Option {
@@ -121,13 +138,14 @@ func WithLogger(log *slog.Logger) Option {
 // New returns a limiter that uses pool.
 func New(pool *pgxpool.Pool, opts ...Option) *Limiter {
 	l := &Limiter{
-		pool:      pool,
-		q:         db.New(pool),
-		now:       time.Now,
-		ttl:       DefaultLeaseTTL,
-		retention: DefaultRetention,
-		log:       slog.Default(),
-		open:      make(map[int64]struct{}),
+		pool:            pool,
+		q:               db.New(pool),
+		now:             time.Now,
+		ttl:             DefaultLeaseTTL,
+		retention:       DefaultRetention,
+		ledgerRetention: DefaultLedgerRetention,
+		log:             slog.Default(),
+		open:            make(map[int64]struct{}),
 	}
 	for _, opt := range opts {
 		opt(l)
@@ -164,8 +182,24 @@ func (l *Limiter) SetBudget(ctx context.Context, team string, b limit.Budget) er
 	return nil
 }
 
-// Reserve implements [limit.Limiter].
+// Reserve implements [limit.Limiter]. It is ReserveFor with an empty
+// attribution.
 func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit.Reservation, error) {
+	return l.ReserveFor(ctx, team, tokens, limit.Attribution{})
+}
+
+// maxModelBytes is the longest key ID or model name that the usage ledger
+// records.
+const maxModelBytes = 256
+
+// ReserveFor implements [limit.AttributedLimiter]. The settle or the reap
+// of the reservation charges the usage ledger row of a's key ID and model
+// in the UTC hour when the reservation started. The ledger records a key
+// ID or model name that is longer than 256 bytes, or that holds a NUL
+// byte or invalid UTF-8, as unknown: the model comes from the client, and
+// Postgres text cannot hold such a value.
+func (l *Limiter) ReserveFor(ctx context.Context, team string, tokens int64, a limit.Attribution) (limit.Reservation, error) {
+	a.KeyID, a.Model = ledgerName(a.KeyID), ledgerName(a.Model)
 	if tokens <= 0 {
 		return nil, fmt.Errorf("postgres: reserve %d tokens: must be positive", tokens)
 	}
@@ -197,6 +231,9 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 			Team:        team,
 			WindowStart: w.Start,
 			WindowUs:    b.WindowUs,
+			KeyID:       a.KeyID,
+			Model:       a.Model,
+			Hour:        limit.WindowOf(now, time.Hour).Start,
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
 			return &limit.ExceededError{Team: team, Tokens: tokens, Window: w}
@@ -220,6 +257,14 @@ func (l *Limiter) Reserve(ctx context.Context, team string, tokens int64) (limit
 	}
 	l.track(id, true)
 	return &reservation{l: l, id: id, team: team, window: w, held: tokens}, nil
+}
+
+// ledgerName returns s, or "" when the usage ledger cannot record it.
+func ledgerName(s string) string {
+	if len(s) > maxModelBytes || strings.ContainsRune(s, 0) || !utf8.ValidString(s) {
+		return ""
+	}
+	return s
 }
 
 // track adds id to or drops it from the reservations that Run renews.
@@ -285,15 +330,34 @@ func (r *reservation) TopUp(ctx context.Context, tokens int64) error {
 	return nil
 }
 
-// Settle implements [limit.Reservation]. After any Settle, Run stops
-// renewing the lease: a reservation whose settle failed is reaped, so its
-// tokens do not stay held for good.
+// Settle implements [limit.Reservation]. It is SettleUsage with all of
+// used in [limit.Usage.Estimated], since the kinds are not known.
 func (r *reservation) Settle(ctx context.Context, used int64) error {
 	if used < 0 {
 		return fmt.Errorf("postgres: settle %d tokens: must not be negative", used)
 	}
+	return r.SettleUsage(ctx, limit.Usage{Estimated: used})
+}
+
+// SettleUsage implements [limit.UsageSettler]. It charges u.Total() to the
+// window and adds u to the usage ledger in one statement. After any
+// settle, Run stops renewing the lease: a reservation whose settle failed
+// is reaped, so its tokens do not stay held for good.
+func (r *reservation) SettleUsage(ctx context.Context, u limit.Usage) error {
+	if min(u.Input, u.Output, u.CacheWrite, u.CacheRead, u.Estimated) < 0 {
+		return fmt.Errorf("postgres: settle %+v: counts must not be negative", u)
+	}
+	used := u.Total()
 	defer r.l.track(r.id, false)
-	_, err := r.l.q.Settle(ctx, db.SettleParams{ID: r.id, Used: used})
+	_, err := r.l.q.Settle(ctx, db.SettleParams{
+		ID:         r.id,
+		Used:       used,
+		Input:      u.Input,
+		Output:     u.Output,
+		CacheWrite: u.CacheWrite,
+		CacheRead:  u.CacheRead,
+		Estimated:  u.Estimated,
+	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("postgres: settle: %w", limit.ErrReservationClosed)
 	}

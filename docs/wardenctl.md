@@ -94,10 +94,33 @@ red   2026-11-17T15:00:00Z  1h      38210    1024      1000000  2
 | `BUDGET` | The current budget of the team, or `-` when the team has no budget with this window length. |
 | `OPEN` | Open reservations in this window. |
 
+With `-by` or `-hourly`, it lists the usage ledger instead: the tokens
+that ended requests used, summed per team and per the chosen key ID,
+model, or hour. The gateway writes the ledger when a request settles or
+when the lease reaper charges it, in the same transaction as the window
+count. A row counts in the UTC hour when its request started.
+
+```text
+$ wardenctl usage -by key,model
+TEAM  KEY           MODEL            REQUESTS  INPUT  OUTPUT  CACHE_WRITE  CACHE_READ  ESTIMATED  REAPED  TOTAL
+red   3f9a01c2b7de  claude-test-a    12        4810   9230    0            1200        0          0       15240
+red   3f9a01c2b7de  claude-test-b    3         900    1500    0            0           64         512     2976
+```
+
+| Column | Value |
+|---|---|
+| `KEY`, `MODEL` | `-` when the gateway did not know it, for example for a request of a replica from before the ledger. |
+| `INPUT`, `OUTPUT`, `CACHE_WRITE`, `CACHE_READ` | Tokens that the upstream reported. |
+| `ESTIMATED` | Tokens that the gateway charged from its own estimate, because the upstream did not report them, for example for a cut-off stream. |
+| `REAPED` | Tokens that the lease reaper charged for requests whose replica stopped. |
+| `TOTAL` | The sum of the token columns. |
+
 | Flag | Default | Value |
 |---|---|---|
 | `-team` | none | Show only this team. |
-| `-since` | `24h` | Show windows that ended less than this long ago. |
+| `-since` | `24h` | Show windows or hours that ended less than this long ago. |
+| `-by` | none | Show the usage ledger per `key`, `model`, or `key,model`. |
+| `-hourly` | `false` | Show the usage ledger per hour. |
 
 ### `wardenctl keys create`
 

@@ -27,6 +27,29 @@ WHERE (sqlc.arg(team)::text = '' OR u.team = sqlc.arg(team)::text)
   AND u.window_start + u.window_us * interval '1 microsecond' > sqlc.arg(since)::timestamptz
 ORDER BY u.team, u.window_start DESC;
 
+-- ListLedger sums the usage ledger rows of hours that end after @since.
+-- It groups by team, and also by hour, key ID, or model when the matching
+-- flag is true; a column that is not grouped is the epoch or empty. Sums that
+-- pass the bigint maximum stop at it.
+-- name: ListLedger :many
+SELECT
+    l.team,
+    (CASE WHEN sqlc.arg(by_hour)::boolean THEN l.hour ELSE 'epoch' END)::timestamptz AS hour,
+    (CASE WHEN sqlc.arg(by_key)::boolean THEN l.key_id ELSE '' END)::text AS key_id,
+    (CASE WHEN sqlc.arg(by_model)::boolean THEN l.model ELSE '' END)::text AS model,
+    LEAST(sum(l.requests), 9223372036854775807)::bigint AS requests,
+    LEAST(sum(l.input_tokens), 9223372036854775807)::bigint AS input_tokens,
+    LEAST(sum(l.output_tokens), 9223372036854775807)::bigint AS output_tokens,
+    LEAST(sum(l.cache_write_tokens), 9223372036854775807)::bigint AS cache_write_tokens,
+    LEAST(sum(l.cache_read_tokens), 9223372036854775807)::bigint AS cache_read_tokens,
+    LEAST(sum(l.estimated_tokens), 9223372036854775807)::bigint AS estimated_tokens,
+    LEAST(sum(l.reaped_tokens), 9223372036854775807)::bigint AS reaped_tokens
+FROM usage_ledger l
+WHERE (sqlc.arg(team)::text = '' OR l.team = sqlc.arg(team)::text)
+  AND l.hour + interval '1 hour' > sqlc.arg(since)::timestamptz
+GROUP BY 1, 2, 3, 4
+ORDER BY 1, 2 DESC, 3, 4;
+
 -- InsertKey adds a gateway key. It changes no row when a row, revoked or
 -- not, has the same key ID; the unique index gateway_keys_key_id decides,
 -- so two concurrent inserts cannot both win.

@@ -26,8 +26,10 @@ WITH w AS (
       AND sqlc.arg(tokens)::bigint <= sqlc.arg(budget)::bigint - u.settled - u.reserved
     RETURNING u.team, u.window_start, u.window_us
 )
-INSERT INTO reservations (team, window_start, window_us, budget, held, expires_at)
-SELECT w.team, w.window_start, w.window_us, @budget::bigint, @tokens::bigint, @expires_at::timestamptz FROM w
+INSERT INTO reservations (team, window_start, window_us, budget, held, expires_at, key_id, model, hour)
+SELECT w.team, w.window_start, w.window_us, @budget::bigint, @tokens::bigint, @expires_at::timestamptz,
+       @key_id::text, @model::text, @hour::timestamptz
+FROM w
 RETURNING id;
 
 -- TopUp holds more tokens for an open reservation in its own window and
@@ -61,16 +63,20 @@ SELECT
     EXISTS (SELECT 1 FROM h) AS granted;
 
 -- Settle deletes a reservation, frees what it held, charges used tokens to
--- its window, and frees its in-flight slot. It returns no row when the
--- reservation has already settled. settled saturates at the bigint maximum
--- instead of raising an overflow error. The budget update reads the window
--- update's rows, so it runs after it: rows lock in the order reservation,
--- window, budget, as in Reserve and the reaper.
+-- its window, frees its in-flight slot, and adds the usage to the ledger
+-- row of the reservation's hour, key ID, and model. used is the sum of the
+-- five token kinds. It returns no row when the reservation has already
+-- settled. Counts saturate at the bigint maximum instead of raising an
+-- overflow error. The budget update reads the window update's rows, and the
+-- ledger update reads the budget update's count, so rows lock in the order
+-- reservation, window, budget, ledger, as in Reserve and the reaper. A
+-- settle of zero tokens adds no ledger row.
 -- name: Settle :one
 WITH r AS (
     DELETE FROM reservations res
     WHERE res.id = @id
-    RETURNING res.team, res.window_start, res.window_us, res.held
+    RETURNING res.team, res.window_start, res.window_us, res.held, res.key_id, res.model,
+              COALESCE(res.hour, date_trunc('hour', res.created_at, 'UTC')) AS hour
 ), w AS (
     UPDATE usage_windows u
     SET reserved = u.reserved - r.held,
@@ -86,6 +92,20 @@ WITH r AS (
     FROM w
     WHERE bu.team = w.team
     RETURNING bu.team
+), l AS (
+    INSERT INTO usage_ledger AS ul (team, hour, key_id, model, requests,
+        input_tokens, output_tokens, cache_write_tokens, cache_read_tokens, estimated_tokens)
+    SELECT r.team, r.hour, r.key_id, r.model, 1,
+        @input::bigint, @output::bigint, @cache_write::bigint, @cache_read::bigint, @estimated::bigint
+    FROM r, (SELECT count(*) FROM b) AS after_budget
+    WHERE @used::bigint > 0
+    ON CONFLICT (team, hour, key_id, model) DO UPDATE
+    SET requests           = LEAST(ul.requests, 9223372036854775806) + 1,
+        input_tokens       = LEAST(ul.input_tokens, 9223372036854775807 - EXCLUDED.input_tokens) + EXCLUDED.input_tokens,
+        output_tokens      = LEAST(ul.output_tokens, 9223372036854775807 - EXCLUDED.output_tokens) + EXCLUDED.output_tokens,
+        cache_write_tokens = LEAST(ul.cache_write_tokens, 9223372036854775807 - EXCLUDED.cache_write_tokens) + EXCLUDED.cache_write_tokens,
+        cache_read_tokens  = LEAST(ul.cache_read_tokens, 9223372036854775807 - EXCLUDED.cache_read_tokens) + EXCLUDED.cache_read_tokens,
+        estimated_tokens   = LEAST(ul.estimated_tokens, 9223372036854775807 - EXCLUDED.estimated_tokens) + EXCLUDED.estimated_tokens
 )
 SELECT w.settled FROM w;
 
@@ -109,7 +129,8 @@ WHERE res.id IN (
     LIMIT sqlc.arg(max_rows)::int
     FOR UPDATE SKIP LOCKED
 )
-RETURNING res.team, res.window_start, res.window_us, res.held;
+RETURNING res.team, res.window_start, res.window_us, res.held, res.key_id, res.model,
+          COALESCE(res.hour, date_trunc('hour', res.created_at, 'UTC'))::timestamptz AS hour;
 
 -- ChargeHeld moves tokens of reaped reservations from reserved to settled
 -- in one window. settled saturates as in Settle.
@@ -147,3 +168,18 @@ WHERE u.window_start + u.window_us * interval '1 microsecond' <= @ended_by::time
         AND r.window_start = u.window_start
         AND r.window_us = u.window_us
   );
+
+-- ChargeLedgerReaped adds the held tokens of reaped reservations to one
+-- ledger row. The reaper runs it after the window and budget updates, in
+-- the same transaction. Counts saturate as in Settle.
+-- name: ChargeLedgerReaped :exec
+INSERT INTO usage_ledger AS ul (team, hour, key_id, model, requests, reaped_tokens)
+VALUES (@team, @hour, @key_id, @model, @requests, @reaped)
+ON CONFLICT (team, hour, key_id, model) DO UPDATE
+SET requests      = LEAST(ul.requests, 9223372036854775807 - EXCLUDED.requests) + EXCLUDED.requests,
+    reaped_tokens = LEAST(ul.reaped_tokens, 9223372036854775807 - EXCLUDED.reaped_tokens) + EXCLUDED.reaped_tokens;
+
+-- PruneLedger deletes the ledger rows of hours that started before the
+-- given time.
+-- name: PruneLedger :execrows
+DELETE FROM usage_ledger WHERE hour < @before::timestamptz;

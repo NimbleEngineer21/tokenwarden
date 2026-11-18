@@ -3,6 +3,7 @@ package postgres
 import (
 	"cmp"
 	"context"
+	"errors"
 	"log/slog"
 	"maps"
 	"math"
@@ -25,7 +26,8 @@ const (
 
 // Run renews the leases of this limiter's open reservations, reaps the
 // reservations of every replica whose leases ended, and deletes the usage
-// counts of windows that ended more than the retention ago. It returns when
+// counts of windows that ended more than the retention ago and the usage
+// ledger rows older than the ledger retention. It returns when
 // ctx is done. It logs failures and keeps running, so that a short database
 // outage does not stop it. Call Run once per Limiter.
 //
@@ -108,12 +110,26 @@ type windowKey struct {
 	us      int64
 }
 
+// ledgerKey names one usage ledger row.
+type ledgerKey struct {
+	team   string
+	hourUs int64
+	keyID  string
+	model  string
+}
+
+// ledgerCharge is what reaped reservations add to one ledger row.
+type ledgerCharge struct {
+	requests int64
+	tokens   int64
+}
+
 // reapBatch deletes up to reapBatch expired reservations, charges what they
-// held to their windows, and frees their in-flight slots, in one
-// transaction. It updates the windows in key order and then the budgets in
-// team order, so that two replicas that reap at the same time cannot
-// deadlock, and a Settle or Reserve, which lock a window before a budget,
-// cannot deadlock with it.
+// held to their windows and to the usage ledger, and frees their in-flight
+// slots, in one transaction. It updates the windows in key order, then the
+// budgets in team order, then the ledger rows in key order, so that two
+// replicas that reap at the same time cannot deadlock, and a Settle or
+// Reserve, which lock in the same order, cannot deadlock with it.
 func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error) {
 	err = pgx.BeginFunc(ctx, l.pool, func(tx pgx.Tx) error {
 		q := l.q.WithTx(tx)
@@ -123,11 +139,17 @@ func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error
 		}
 		held := make(map[windowKey]int64)
 		slots := make(map[string]int64)
+		ledger := make(map[ledgerKey]ledgerCharge)
 		for _, r := range rows {
 			slots[r.Team]++
 			k := windowKey{r.Team, r.WindowStart.UnixMicro(), r.WindowUs}
 			// The sum fits: it is at most the window's reserved count.
 			held[k] += r.Held
+			// An hour's row can take tokens from two windows when the
+			// budget's window length changed, so this sum saturates.
+			lk := ledgerKey{r.Team, r.Hour.UnixMicro(), r.KeyID, r.Model}
+			c := ledger[lk]
+			ledger[lk] = ledgerCharge{c.requests + 1, min(c.tokens, math.MaxInt64-r.Held) + r.Held}
 		}
 		keys := slices.SortedFunc(maps.Keys(held), func(a, b windowKey) int {
 			return cmp.Or(cmp.Compare(a.team, b.team), cmp.Compare(a.startUs, b.startUs), cmp.Compare(a.us, b.us))
@@ -150,6 +172,23 @@ func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error
 				return err
 			}
 		}
+		lkeys := slices.SortedFunc(maps.Keys(ledger), func(a, b ledgerKey) int {
+			return cmp.Or(cmp.Compare(a.team, b.team), cmp.Compare(a.hourUs, b.hourUs),
+				cmp.Compare(a.keyID, b.keyID), cmp.Compare(a.model, b.model))
+		})
+		for _, k := range lkeys {
+			err := q.ChargeLedgerReaped(ctx, db.ChargeLedgerReapedParams{
+				Team:     k.team,
+				Hour:     time.UnixMicro(k.hourUs).UTC(),
+				KeyID:    k.keyID,
+				Model:    k.model,
+				Requests: ledger[k].requests,
+				Reaped:   ledger[k].tokens,
+			})
+			if err != nil {
+				return err
+			}
+		}
 		n = len(rows)
 		return nil
 	})
@@ -160,8 +199,11 @@ func (l *Limiter) reapBatch(ctx context.Context) (n int, tokens int64, err error
 }
 
 // prune deletes the usage counts of windows that ended more than the
-// retention ago.
+// retention ago, and the usage ledger rows of hours that started more than
+// the ledger retention ago.
 func (l *Limiter) prune(ctx context.Context) error {
-	_, err := l.q.PruneWindows(ctx, l.now().Add(-l.retention))
-	return err
+	now := l.now()
+	_, err := l.q.PruneWindows(ctx, now.Add(-l.retention))
+	_, lerr := l.q.PruneLedger(ctx, now.Add(-l.ledgerRetention))
+	return errors.Join(err, lerr)
 }

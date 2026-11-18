@@ -1,6 +1,7 @@
 package limit_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -50,5 +51,22 @@ func TestWindowOfPanicsOnBadLength(t *testing.T) {
 			}()
 			limit.WindowOf(time.Now(), length)
 		}()
+	}
+}
+
+func TestUsageTotal(t *testing.T) {
+	tests := []struct {
+		u    limit.Usage
+		want int64
+	}{
+		{limit.Usage{}, 0},
+		{limit.Usage{Input: 1, Output: 2, CacheWrite: 3, CacheRead: 4, Estimated: 5}, 15},
+		{limit.Usage{Input: math.MaxInt64, Estimated: 1}, math.MaxInt64},
+		{limit.Usage{Output: math.MaxInt64 - 1, CacheRead: 1}, math.MaxInt64},
+	}
+	for _, tt := range tests {
+		if got := tt.u.Total(); got != tt.want {
+			t.Errorf("%+v.Total() = %d, want %d", tt.u, got, tt.want)
+		}
 	}
 }

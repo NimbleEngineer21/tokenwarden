@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -143,6 +144,57 @@ type Reservation interface {
 	// [context.WithoutCancel], so that a lost client cannot stop the
 	// settle.
 	Settle(ctx context.Context, used int64) error
+}
+
+// Attribution names the gateway key and the model of a request, so that a
+// [Limiter] that keeps a usage ledger can charge the usage to them. An
+// empty field means that it is not known.
+type Attribution struct {
+	// KeyID is the key ID of the gateway key, never the key.
+	KeyID string
+	// Model is the model that the request asked for.
+	Model string
+}
+
+// AttributedLimiter is a [Limiter] that can record which key and model a
+// reservation is for. A caller that knows them should check for it and
+// call ReserveFor instead of Reserve.
+type AttributedLimiter interface {
+	Limiter
+	// ReserveFor is [Limiter.Reserve] for a request with the given
+	// attribution.
+	ReserveFor(ctx context.Context, team string, tokens int64, a Attribution) (Reservation, error)
+}
+
+// Usage is the used tokens of one request by kind. All counts must not be
+// negative.
+type Usage struct {
+	Input      int64
+	Output     int64
+	CacheWrite int64
+	CacheRead  int64
+	// Estimated is the tokens that the caller charges from its own
+	// estimate, because the upstream did not report them.
+	Estimated int64
+}
+
+// Total returns the sum of all counts. It stops at the int64 maximum.
+func (u Usage) Total() int64 {
+	var t int64
+	for _, n := range []int64{u.Input, u.Output, u.CacheWrite, u.CacheRead, u.Estimated} {
+		t = min(t, math.MaxInt64-max(n, 0)) + max(n, 0)
+	}
+	return t
+}
+
+// UsageSettler is a [Reservation] that can record used tokens by kind. A
+// caller that knows the kinds should check for it and call SettleUsage
+// instead of Settle.
+type UsageSettler interface {
+	Reservation
+	// SettleUsage is [Reservation.Settle] with used equal to u.Total(). It
+	// returns an error if a count is negative.
+	SettleUsage(ctx context.Context, u Usage) error
 }
 
 // Estimator guesses token counts before the upstream reports the real ones.

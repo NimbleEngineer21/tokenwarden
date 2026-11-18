@@ -56,7 +56,13 @@ func (g *gateway) reserve(ctx context.Context, w http.ResponseWriter, ev *audit.
 	if stream {
 		first = satAdd(input, min(topUpChunk, *p.MaxTokens))
 	}
-	res, err := g.limiter.Reserve(ctx, ev.Team, first)
+	var res limit.Reservation
+	var err error
+	if al, ok := g.limiter.(limit.AttributedLimiter); ok {
+		res, err = al.ReserveFor(ctx, ev.Team, first, limit.Attribution{KeyID: ev.KeyID, Model: ev.Model})
+	} else {
+		res, err = g.limiter.Reserve(ctx, ev.Team, first)
+	}
 	if err == nil {
 		b.res = res
 		return b
@@ -110,33 +116,50 @@ func (b *budget) ensure(ctx context.Context, m *metrics, n int64) error {
 	return nil
 }
 
-// used returns the tokens to charge for the request. A reply that did not
-// start costs nothing. A whole reply costs what the upstream reported. A
-// reply that ended early costs at least the gateway's own estimate, since
-// the upstream report of a cut-off stream can lack the output so far.
-func (b *budget) used(ev *audit.Event) int64 {
+// usage returns the tokens to charge for the request, by kind. A reply
+// that did not start costs nothing. A whole reply costs what the upstream
+// reported. A reply that ended early costs at least the gateway's own
+// estimate, since the upstream report of a cut-off stream can lack the
+// output so far. Tokens that the upstream did not report are Estimated.
+func (b *budget) usage(ev *audit.Event) limit.Usage {
 	if ev.Status < 200 || ev.Status >= 300 {
-		return 0
+		return limit.Usage{}
 	}
-	u := ev.Usage
-	in := u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+	u := limit.Usage{
+		Input:      ev.Usage.InputTokens,
+		Output:     ev.Usage.OutputTokens,
+		CacheWrite: ev.Usage.CacheCreationInputTokens,
+		CacheRead:  ev.Usage.CacheReadInputTokens,
+	}
 	if ev.Outcome == audit.OutcomeOK {
-		if in+u.OutputTokens == 0 {
+		if u.Total() == 0 {
 			// The usage could not be read; charge the hold.
-			return b.res.Reserved()
+			return limit.Usage{Estimated: b.res.Reserved()}
 		}
-		return in + u.OutputTokens
+		return u
 	}
-	if in == 0 {
-		in = b.input
+	if u.Input+u.CacheWrite+u.CacheRead == 0 {
+		u.Estimated = b.input
 	}
-	return satAdd(in, max(u.OutputTokens, b.est.OutputTokens(b.outBytes)))
+	if out := b.est.OutputTokens(b.outBytes); out > u.Output {
+		u.Estimated = satAdd(u.Estimated, out-u.Output)
+	}
+	return u
 }
 
-// settle ends the reservation. It runs after the reply, so it can only log
-// a failure; the tokens then stay held.
+// settle ends the reservation, by kind when the reservation can record
+// kinds. It runs after the reply, so it can only log a failure; the tokens
+// then stay held.
 func (b *budget) settle(ctx context.Context, ev *audit.Event, log *slog.Logger) {
-	if err := b.res.Settle(context.WithoutCancel(ctx), b.used(ev)); err != nil {
+	ctx = context.WithoutCancel(ctx)
+	u := b.usage(ev)
+	var err error
+	if us, ok := b.res.(limit.UsageSettler); ok {
+		err = us.SettleUsage(ctx, u)
+	} else {
+		err = b.res.Settle(ctx, u.Total())
+	}
+	if err != nil {
 		log.ErrorContext(ctx, "settle failed", "err", err)
 	}
 }
